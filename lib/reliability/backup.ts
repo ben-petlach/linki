@@ -62,7 +62,7 @@ export async function backupDatabase(sourcePath: string, destinationPath: string
   closeSync(reservation);
   try {
     await copyConsistently(sourcePath, destination);
-    return manifest(destination);
+    return await manifest(destination);
   } catch (error) {
     rmSync(destination, { force: true });
     throw error;
@@ -74,6 +74,8 @@ export async function restoreDatabase(backupPath: string, targetPath: string): P
   const target = path.resolve(targetPath);
   const temporary = path.join(path.dirname(target), `.linki-restore-${randomUUID()}.db`);
   try {
+    const reservation = openSync(temporary, "wx", 0o600);
+    closeSync(reservation);
     await copyConsistently(backupPath, temporary);
     const db = new Database(temporary);
     try {

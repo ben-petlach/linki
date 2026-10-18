@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import nextEnv from "@next/env";
 import { assertProductionRuntime } from "../lib/runtime-config.ts";
 
+process.env.NODE_ENV = "production";
+nextEnv.loadEnvConfig(process.cwd(), false);
 try {
   assertProductionRuntime();
 } catch (error) {

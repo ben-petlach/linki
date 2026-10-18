@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import Database from "better-sqlite3";
 import { getDb } from "../../lib/db";
 import { backupDatabase, restoreDatabase } from "../../lib/reliability/backup";
@@ -22,6 +24,64 @@ test("startup rejects missing and placeholder credentials without echoing values
     NEXTAUTH_URL: "http://localhost:3456",
     LINKI_DB_PATH: "/data/linki.db",
   }), []);
+});
+
+test("startup validation uses isolated cwd without inheriting repo env files", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "linki-startup-test-"));
+  try {
+    const require = createRequire(import.meta.url);
+    const tsxLoader = require.resolve("tsx");
+    const env = { ...process.env };
+    delete env.NEXTAUTH_SECRET;
+    delete env.AUTH_PASSWORD;
+    delete env.NEXTAUTH_URL;
+    const result = spawnSync(process.execPath, ["--import", tsxLoader, path.resolve("scripts/start-server.mjs")], {
+      cwd: directory, env, encoding: "utf8", timeout: 5000,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Production configuration invalid: NEXTAUTH_SECRET/);
+    assert.match(result.stderr, /AUTH_PASSWORD/);
+    assert.match(result.stderr, /NEXTAUTH_URL/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Next env loader reads local production credentials before validation", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "linki-env-test-"));
+  try {
+    writeFileSync(path.join(directory, ".env.local"), [
+      "NEXTAUTH_SECRET=synthetic-local-secret-123456789012345",
+      "AUTH_PASSWORD=synthetic-local-password-123456",
+      "NEXTAUTH_URL=http://localhost:3456",
+    ].join("\n"));
+    const require = createRequire(import.meta.url);
+    const modulePath = require.resolve("@next/env");
+    const env = { ...process.env };
+    delete env.NEXTAUTH_SECRET;
+    delete env.AUTH_PASSWORD;
+    delete env.NEXTAUTH_URL;
+    const script = "require(process.argv[1]).loadEnvConfig(process.cwd(), false); if (!process.env.NEXTAUTH_SECRET || !process.env.AUTH_PASSWORD || !process.env.NEXTAUTH_URL) process.exit(2)";
+    const result = spawnSync(process.execPath, ["-e", script, modulePath], { cwd: directory, env, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("invalid SQLite backup is removed after failed validation", async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "linki-invalid-backup-test-"));
+  try {
+    const source = path.join(directory, "invalid.db");
+    const output = path.join(directory, "backup.db");
+    const db = new Database(source);
+    db.exec("CREATE TABLE unrelated (id TEXT PRIMARY KEY)");
+    db.close();
+    await assert.rejects(backupDatabase(source, output), /Backup lacks required table/);
+    assert.equal(existsSync(output), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("backup captures WAL state; restore publishes new paused DB and refuses overwrite", async () => {

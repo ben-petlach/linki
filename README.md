@@ -110,6 +110,9 @@ No SaaS middleman. No per-seat pricing. No black box.
 
 [![Deploy with Opsily](public/deploy-with-opsily.svg)](https://opsily.com/hosting/linki?utm_source=github&utm_medium=readme&utm_campaign=linki)
 
+That managed listing is upstream Linki. It has not been verified to run this
+fork's reliability changes. Use the source build below for this fork.
+
 ### Self-host with Docker
 
 **1. Create your environment file**
