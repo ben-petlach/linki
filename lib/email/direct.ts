@@ -94,23 +94,19 @@ function gate(db: Database.Database, targetId: string, accountId: string, recipi
     LEFT JOIN email_outbound o ON o.action_key = a.action_key
     WHERE a.sender_id = ? AND a.channel = 'email' AND a.action_key != ?
       AND ((a.dispatched_at IS NOT NULL AND date(COALESCE(o.accepted_at, a.dispatched_at)) = date('now'))
-        OR (a.state = 'claimed' AND o.action_key IS NOT NULL))`).get(accountId, actionKey) as { count: number };
+        OR (a.state = 'claimed' AND a.lease_until > ? AND o.action_key IS NOT NULL))`).get(accountId, actionKey, Date.now()) as { count: number };
   const orphaned = db.prepare(`SELECT COUNT(*) AS count FROM email_outbound o
     WHERE o.email_account_id = ? AND o.accepted_at IS NOT NULL AND date(o.accepted_at) = date('now')
       AND NOT EXISTS (SELECT 1 FROM dispatch_actions a WHERE a.action_key = o.action_key)`)
     .get(accountId) as { count: number };
-  // Old installs recorded sends only in logs. Keep those in cap until history ages out.
+  // Old installs recorded sends only in logs. Count them conservatively: a log may
+  // duplicate a durable action, but fuzzy time matching could undercount real sends.
   const legacy = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'logs'").get()
     ? db.prepare(`SELECT COUNT(*) AS count FROM logs l
         WHERE l.message LIKE 'Email sent%' AND date(l.created_at) = date('now')
           AND EXISTS (SELECT 1 FROM run_profiles rp WHERE rp.run_id = l.run_id
-            AND rp.target_id = l.target_id AND rp.email_account_id = ?)
-          AND NOT EXISTS (SELECT 1 FROM email_outbound o
-            JOIN dispatch_actions a ON a.action_key = o.action_key
-            WHERE o.target_id = l.target_id AND o.email_account_id = ?
-              AND a.dispatched_at IS NOT NULL
-              AND ABS(strftime('%s', a.dispatched_at) - strftime('%s', l.created_at)) <= 600)`)
-      .get(accountId, accountId) as { count: number }
+            AND rp.target_id = l.target_id AND rp.email_account_id = ?)`)
+      .get(accountId) as { count: number }
     : { count: 0 };
   const used = durable.count + orphaned.count + legacy.count + (registered ? 1 : 0);
   if (registered ? used > (account.daily_email_limit ?? 0) : used >= (account.daily_email_limit ?? 0)) return "Daily email limit reached";

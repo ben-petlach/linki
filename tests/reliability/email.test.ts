@@ -13,7 +13,7 @@ import { initEmailReliabilitySchema, registerOutboundEmail, markOutboundAccepted
 import { initSuppressionSchema, evaluateEligibility, suppressIdentity } from "../../lib/reliability/suppression";
 import { testSmtpConnection } from "../../lib/email/sender";
 import { sendDirectEmail } from "../../lib/email/direct";
-import { claimAction, initActionSchema } from "../../lib/reliability/actions";
+import { claimAction, beginDispatch, initActionSchema } from "../../lib/reliability/actions";
 import { initInboxStateSchema, recordInboxSyncSuccess } from "../../lib/reliability/inbox-state";
 
 function fixture() {
@@ -300,6 +300,15 @@ test("local TLS SMTP sends once per direct action and late suppression blocks ne
   const db = new Database(dbPath);
   initInboxStateSchema(db);
   recordInboxSyncSuccess(db, { accountId: "account", channel: "email" });
+  db.prepare("UPDATE email_accounts SET daily_email_limit=1 WHERE id='account'").run();
+  initActionSchema(db);
+  const staleKey = "manual-email:b:account:expired-other-request";
+  const staleClaim = claimAction(db, { key: staleKey, senderId: "account", targetId: "b", channel: "email",
+    now: Date.now() - 86_400_000, leaseMs: 60_000 });
+  assert.equal(staleClaim.claimed, true);
+  registerOutboundEmail(db, { actionKey: staleKey, targetId: "b", emailAccountId: "account",
+    recipient: "bob@example.com", messageId: "<stale-other@sender.test>", subject: "Old",
+    createdAt: new Date(Date.now() - 86_400_000).toISOString() });
   db.close();
   const port = (server.server.address() as { port: number }).port;
   const childPath = resolve("tests/reliability/fixtures/direct-send-child.ts");
@@ -319,6 +328,11 @@ test("local TLS SMTP sends once per direct action and late suppression blocks ne
     assert.equal((await invoke("direct-request-1")).ok, true);
     assert.equal((await invoke("direct-request-1")).ok, false);
     assert.equal(received, 1);
+    const checkStale = new Database(dbPath);
+    try {
+      if (staleClaim.claimed) assert.equal(beginDispatch(checkStale, staleKey, staleClaim.token, () => null).started, false);
+      checkStale.prepare("UPDATE email_accounts SET daily_email_limit=2 WHERE id='account'").run();
+    } finally { checkStale.close(); }
     assert.equal((await invoke("direct-request-reply", "<inbound-1@example.com>")).ok, true);
     assert.equal(received, 2);
     assert.match(receivedMessages[1], /In-Reply-To: <inbound-1@example.com>/i);
@@ -405,6 +419,34 @@ test("previous-day registered action consumes cap when dispatched today", async 
     assert.equal((db.prepare("SELECT created_at FROM email_outbound WHERE action_key = ?").get(key) as { created_at: string }).created_at, yesterday);
     const next = await sendDirectEmail(db, { targetId: "a", account, recipient: "alice@example.com",
       subject: "Another", body: "Test", idempotencyKey: "next-request-123" });
+    assert.equal(next.ok, false);
+    if (!next.ok) assert.match(next.error, /Daily email limit reached/);
+  } finally { db.close(); }
+});
+
+test("legacy send log and nearby durable action each consume a daily slot", async () => {
+  const db = fixture();
+  const key = "manual-email:a:account:durable-today";
+  const account = {
+    id: "account", from_email: "sender@sender.test", from_name: null,
+    smtp_host: "127.0.0.1", smtp_port: 1, smtp_secure: 0,
+    username: "sender", password: "pass",
+  };
+  try {
+    db.exec("CREATE TABLE logs (run_id TEXT, target_id TEXT, message TEXT, created_at TEXT)");
+    db.prepare("UPDATE email_accounts SET daily_email_limit=2 WHERE id='account'").run();
+    initInboxStateSchema(db);
+    recordInboxSyncSuccess(db, { accountId: "account", channel: "email" });
+    initActionSchema(db);
+    const claim = claimAction(db, { key, senderId: "account", targetId: "a", channel: "email" });
+    assert.equal(claim.claimed, true);
+    if (!claim.claimed) return;
+    registerOutboundEmail(db, { actionKey: key, targetId: "a", emailAccountId: "account",
+      recipient: "alice@example.com", messageId: "<durable-today@sender.test>", subject: "Hello" });
+    assert.equal(beginDispatch(db, key, claim.token, () => null).started, true);
+    db.prepare("INSERT INTO logs (run_id,target_id,message,created_at) VALUES ('r','a','Email sent legacy',datetime('now'))").run();
+    const next = await sendDirectEmail(db, { targetId: "a", account, recipient: "alice@example.com",
+      subject: "Another", body: "Test", idempotencyKey: "third-request-123" });
     assert.equal(next.ok, false);
     if (!next.ok) assert.match(next.error, /Daily email limit reached/);
   } finally { db.close(); }
