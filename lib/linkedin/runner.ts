@@ -262,6 +262,15 @@ function trRecordContext(db: ReturnType<typeof getDb>, tr: TrackRun, ctx: { link
 }
 
 type SendChannel = "connect" | "message" | "sales_inmail" | "email";
+function canonicalRecipient(channel: SendChannel, value: string): string | null {
+  if (channel === "email") return value.trim().toLowerCase() || null;
+  try {
+    const url = new URL(value);
+    if (!/(^|\.)linkedin\.com$/i.test(url.hostname)) return null;
+    const match = url.pathname.match(/^\/in\/([^/]+)\/?$/i);
+    return match ? decodeURIComponent(match[1]).toLowerCase() : null;
+  } catch { return null; }
+}
 
 // Every external send crosses this boundary. The action becomes irrevocable before
 // the provider call: a crash or timeout after that point holds the step for review.
@@ -270,7 +279,7 @@ class DispatchBlockedError extends Error {}
 export async function dispatchStep<T>(
   db: ReturnType<typeof getDb>, tr: TrackRun, step: WorkflowStep, target: Target,
   senderId: string, channel: SendChannel, limit: number, schedule: ScheduleConfig,
-  payload: string,
+  payload: string, recipientIdentity: string,
   send: (beforeSend: () => void) => Promise<T>, evidence: (result: T) => string
 ): Promise<"sent" | "confirmed" | "held" | "deferred"> {
   const key = actionKey(tr.id, step.id);
@@ -296,7 +305,15 @@ export async function dispatchStep<T>(
       }
       const track = db.prepare("SELECT state, current_step FROM run_profile_tracks WHERE id = ?").get(tr.id) as { state: string; current_step: number } | undefined;
       if (track?.state !== "in_progress" || track.current_step !== tr.current_step) return "step changed";
-      const reply = db.prepare("SELECT last_replied_at, email_replied_at FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null } | undefined;
+      const assignment = db.prepare(`SELECT r.account_id, rp.email_account_id FROM run_profiles rp
+        JOIN runs r ON r.id = rp.run_id WHERE rp.id = ? AND r.id = ? AND rp.target_id = ?`)
+        .get(tr.run_profile_id, tr.run_id, target.id) as { account_id: string; email_account_id: string | null } | undefined;
+      if (!assignment || (channel === "email" ? assignment.email_account_id !== senderId : assignment.account_id !== senderId)) return "sender assignment changed";
+      const reply = db.prepare("SELECT last_replied_at, email_replied_at, email, linkedin_url FROM targets WHERE id = ?").get(target.id) as {
+        last_replied_at: string | null; email_replied_at: string | null; email: string | null; linkedin_url: string | null;
+      } | undefined;
+      const currentRecipient = canonicalRecipient(channel, channel === "email" ? reply?.email ?? "" : reply?.linkedin_url ?? "");
+      if (!currentRecipient || currentRecipient !== canonicalRecipient(channel, recipientIdentity)) return "recipient identity changed";
       if (reply?.last_replied_at || reply?.email_replied_at) return "lead replied";
       const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin", checkNetNewRules: true });
       if (!suppression.allowed) return `suppressed: ${suppression.blocks.map(b => b.reason).join(", ")}`;
@@ -582,6 +599,32 @@ async function executeStep(
   const step = steps[stepIndex];
   const name = target.full_name ?? target.linkedin_url;
 
+  // A provider acknowledgement can commit before the track advances. Recover
+  // from the durable action without regenerating copy or contacting the provider.
+  if (step.step_type === "connect" || step.step_type === "message" || step.step_type === "email") {
+    const previous = getAction(db, actionKey(tr.id, step.id));
+    if (previous?.state === "sending" || previous?.state === "unknown") {
+      trFail(db, tr, `Action ${previous.action_key} outcome unknown; review required: ${previous.reason ?? "confirmation missing"}`);
+      return;
+    }
+    if (previous?.state === "confirmed") {
+      if (step.step_type === "connect") {
+        recordConnectionRequested(db, { accountId, targetId: target.id, requestedAt: nowIso() });
+        trWait(db, tr, CONNECTION_RECHECK_HOURS);
+      } else if (step.step_type === "message") {
+        if (!previous.payload) { trFail(db, tr, "Confirmed message has no saved content; review required"); return; }
+        trRecordContext(db, tr, { linkedinMessage: previous.payload });
+        trAdvance(db, tr, steps);
+      } else {
+        if (!previous.payload) { trFail(db, tr, "Confirmed email has no saved content; review required"); return; }
+        trRecordContext(db, tr, JSON.parse(previous.payload) as { emailSubject: string; emailBody: string });
+        trAdvance(db, tr, steps);
+      }
+      log(db, runId, target.id, "info", `Recovered confirmed ${step.step_type} action for ${name}`);
+      return;
+    }
+  }
+
   try {
     if (step.step_type === "delay") {
       trAdvance(db, tr, steps);
@@ -636,7 +679,7 @@ async function executeStep(
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending connection request to ${name}`);
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
-      const dispatched = await dispatchStep(db, tr, step, target, accountId, "connect", accountLimits.daily_connection_limit, accountLimits, linkedinUrl,
+      const dispatched = await dispatchStep(db, tr, step, target, accountId, "connect", accountLimits.daily_connection_limit, accountLimits, linkedinUrl, linkedinUrl,
         async beforeSend => {
           const page = await getSessionPage(accountId);
           try { return await sendConnectionRequest(page, linkedinUrl, beforeSend); } finally { await page.close(); }
@@ -729,7 +772,7 @@ async function executeStep(
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending message to ${name}`);
       const messageLinkedinUrl = await getLinkedinUrl(db, target, accountId);
-      const dispatched = await dispatchStep(db, tr, step, target, accountId, "message", accountLimits.daily_message_limit, accountLimits, messageText,
+      const dispatched = await dispatchStep(db, tr, step, target, accountId, "message", accountLimits.daily_message_limit, accountLimits, messageText, messageLinkedinUrl,
         async beforeSend => {
           const page = await getSessionPage(accountId);
           try {
@@ -889,7 +932,7 @@ async function executeStep(
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending email to ${name} <${freshTarget.email}>`);
       const messageId = `<${randomUUID()}@${emailAccount.from_email.split("@")[1]}>`;
-      const dispatched = await dispatchStep(db, tr, step, target, emailAccountId, "email", hardLimit, emailAccountLimits, JSON.stringify({ emailSubject, emailBody }),
+      const dispatched = await dispatchStep(db, tr, step, target, emailAccountId, "email", hardLimit, emailAccountLimits, JSON.stringify({ emailSubject, emailBody }), freshTarget.email,
         async beforeSend => {
           registerOutboundEmail(db, {
             actionKey: actionKey(tr.id, step.id), targetId: target.id, emailAccountId,
