@@ -11,6 +11,7 @@ export interface ActionRecord {
   sender_id: string;
   target_id: string;
   channel: string;
+  recipient_identity: string | null;
   payload: string | null;
   evidence: string | null;
   reason: string | null;
@@ -27,6 +28,7 @@ export function initActionSchema(db: Database.Database): void {
     sender_id TEXT NOT NULL,
     target_id TEXT NOT NULL,
     channel TEXT NOT NULL,
+    recipient_identity TEXT,
     payload TEXT,
     evidence TEXT,
     reason TEXT,
@@ -34,6 +36,8 @@ export function initActionSchema(db: Database.Database): void {
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`);
   db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_actions_sender ON dispatch_actions(sender_id, channel, state)");
+  const columns = db.prepare("PRAGMA table_info(dispatch_actions)").all() as Array<{ name: string }>;
+  if (!columns.some(column => column.name === "recipient_identity")) db.exec("ALTER TABLE dispatch_actions ADD COLUMN recipient_identity TEXT");
 }
 
 export function actionKey(trackRunId: string, stepId: string): string {
@@ -45,7 +49,8 @@ export function getAction(db: Database.Database, key: string): ActionRecord | un
 }
 
 export function claimAction(db: Database.Database, input: {
-  key: string; senderId: string; targetId: string; channel: string; payload?: string; leaseMs?: number; now?: number;
+  key: string; senderId: string; targetId: string; channel: string; recipientIdentity?: string;
+  payload?: string; leaseMs?: number; now?: number;
 }): ClaimResult {
   initActionSchema(db);
   const now = input.now ?? Date.now();
@@ -53,15 +58,21 @@ export function claimAction(db: Database.Database, input: {
   return db.transaction(() => {
     const row = getAction(db, input.key);
     if (!row) {
-      db.prepare(`INSERT INTO dispatch_actions (action_key,state,token,lease_until,sender_id,target_id,channel,payload)
-        VALUES (?, 'claimed', ?, ?, ?, ?, ?, ?)`).run(input.key, token, now + (input.leaseMs ?? 60_000), input.senderId, input.targetId, input.channel, input.payload ?? null);
+      db.prepare(`INSERT INTO dispatch_actions
+        (action_key,state,token,lease_until,sender_id,target_id,channel,recipient_identity,payload)
+        VALUES (?, 'claimed', ?, ?, ?, ?, ?, ?, ?)`)
+        .run(input.key, token, now + (input.leaseMs ?? 60_000), input.senderId, input.targetId,
+          input.channel, input.recipientIdentity ?? null, input.payload ?? null);
       return { claimed: true, token } as ClaimResult;
     }
-    if (row.sender_id !== input.senderId || row.target_id !== input.targetId || row.channel !== input.channel)
+    if (row.sender_id !== input.senderId || row.target_id !== input.targetId || row.channel !== input.channel ||
+        (row.recipient_identity !== null && input.recipientIdentity !== undefined && row.recipient_identity !== input.recipientIdentity))
       return { claimed: false, state: row.state, reason: "action identity mismatch" } as ClaimResult;
     if (row.state === "claimed" && row.lease_until !== null && row.lease_until <= now) {
-      db.prepare(`UPDATE dispatch_actions SET token = ?, lease_until = ?, payload = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE action_key = ? AND state = 'claimed' AND token = ?`).run(token, now + (input.leaseMs ?? 60_000), input.payload ?? null, input.key, row.token);
+      db.prepare(`UPDATE dispatch_actions SET token = ?, lease_until = ?, payload = ?,
+        recipient_identity = COALESCE(recipient_identity, ?), updated_at = CURRENT_TIMESTAMP
+        WHERE action_key = ? AND state = 'claimed' AND token = ?`)
+        .run(token, now + (input.leaseMs ?? 60_000), input.payload ?? null, input.recipientIdentity ?? null, input.key, row.token);
       return { claimed: true, token } as ClaimResult;
     }
     const reason = row.state === "claimed" ? "another worker owns action" :
@@ -90,7 +101,9 @@ export function confirmAction(db: Database.Database, key: string, token: string,
   if (!evidence.trim()) throw new Error("confirmed action requires external evidence");
   const result = db.prepare(`UPDATE dispatch_actions SET state = 'confirmed', evidence = ?, reason = NULL, updated_at = CURRENT_TIMESTAMP
     WHERE action_key = ? AND token = ? AND state = 'sending'`).run(evidence, key, token);
-  return result.changes === 1;
+  if (result.changes === 1) return true;
+  const row = getAction(db, key);
+  return row?.state === "confirmed" && row.token === token && row.evidence === evidence;
 }
 
 export function holdUnknown(db: Database.Database, key: string, token: string, reason: string): boolean {

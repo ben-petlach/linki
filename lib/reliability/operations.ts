@@ -99,7 +99,7 @@ export function listHeldActions(db: Db): HeldAction[] {
   return db.prepare(`SELECT a.action_key, a.state, a.sender_id,
       CASE WHEN a.channel = 'email' THEN ea.name ELSE la.name END AS sender_name,
       a.target_id, t.full_name AS target_name,
-      CASE WHEN a.channel = 'email' THEN COALESCE(o.recipient_email, t.email) ELSE t.linkedin_url END AS recipient,
+      COALESCE(o.recipient_email, a.recipient_identity) AS recipient,
       a.channel, a.payload, a.evidence, a.reason, a.dispatched_at, a.updated_at,
       o.message_id AS provider_message_id, o.accepted_at AS provider_accepted_at
     FROM dispatch_actions a

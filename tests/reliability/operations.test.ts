@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { encode } from "next-auth/jwt";
 import type { NextApiRequest, NextApiResponse } from "next";
-import { beginDispatch, claimAction, getAction, holdUnknown, initActionSchema } from "../../lib/reliability/actions";
+import { beginDispatch, claimAction, confirmAction, getAction, holdUnknown, initActionSchema } from "../../lib/reliability/actions";
 import { initInboxStateSchema } from "../../lib/reliability/inbox-state";
 import {
   evaluateOperationAlerts, getDispatchBlockReason, getGlobalDispatchControl, getOperationMetrics,
@@ -80,6 +80,29 @@ test("unresolved action stays held; only exact durable SMTP acceptance confirms 
       .all("email:1") as Array<{ kind: string; reason: string; evidence: string }>;
     assert.deepEqual(audit.map(row => row.kind), ["review_note", "provider_reconciled"]);
     assert.ok(audit.every(row => row.reason && row.evidence));
+  } finally { db.close(); }
+});
+
+test("operator can reconcile crash-left sending; original recipient and exact worker evidence remain fenced", () => {
+  const db = database();
+  try {
+    const claim = claimAction(db, { key: "inflight", senderId: "sender", targetId: "target", channel: "email",
+      recipientIdentity: "original@example.test" });
+    if (!claim.claimed) throw new Error("claim failed");
+    assert.equal(beginDispatch(db, "inflight", claim.token, () => null).started, true);
+    assert.equal(getAction(db, "inflight")?.recipient_identity, "original@example.test");
+    db.prepare(`INSERT INTO email_outbound (action_key,target_id,email_account_id,recipient_email,message_id,accepted_at)
+      VALUES ('inflight','target','sender','original@example.test','<provider-confirmed>','2026-10-18T13:00:00.000Z')`).run();
+    assert.equal(reviewHeldAction(db, { actionKey: "inflight", actorId: "operator", reason: "Durable SMTP accepted",
+      evidence: "<provider-confirmed>", decision: "confirm_provider_accepted" }).confirmed, true);
+    assert.equal(confirmAction(db, "inflight", claim.token, "<provider-confirmed>"), true);
+    assert.equal(confirmAction(db, "inflight", "stale-token", "<provider-confirmed>"), false);
+    assert.equal(confirmAction(db, "inflight", claim.token, "wrong-id"), false);
+    assert.throws(() => reviewHeldAction(db, { actionKey: "inflight", actorId: "operator", reason: "duplicate",
+      evidence: "<provider-confirmed>", decision: "confirm_provider_accepted" }), /Action is not held/);
+    const row = db.prepare("SELECT before_state, after_state FROM operation_audit WHERE action_key = 'inflight'")
+      .get() as { before_state: string; after_state: string };
+    assert.deepEqual(row, { before_state: "sending", after_state: "confirmed" });
   } finally { db.close(); }
 });
 

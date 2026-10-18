@@ -121,7 +121,8 @@ export default function OperationsPage() {
               <select className="select select-bordered w-full" aria-label="Review decision" value={decision}
                 onChange={event => setDecision(event.target.value as typeof decision)}>
                 <option value="note">Record evidence; keep held</option>
-                {action.channel === "email" && action.provider_accepted_at && <option value="confirm_provider_accepted">Confirm persisted SMTP acceptance</option>}
+                {action.channel === "email" && action.provider_accepted_at &&
+                  <option value="confirm_provider_accepted">Confirm persisted SMTP acceptance</option>}
               </select>
               <input className="input input-bordered w-full" aria-label="Review reason" placeholder="Why this decision?" value={reviewReason}
                 onChange={event => setReviewReason(event.target.value)} maxLength={2000} />
