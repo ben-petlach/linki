@@ -15,40 +15,70 @@ export function initInboxStateSchema(db: Database.Database): void {
       account_id TEXT NOT NULL,
       channel TEXT NOT NULL CHECK(channel IN ('linkedin', 'email')),
       last_successful_at TEXT,
+      last_success_started_at TEXT,
       last_failure_at TEXT,
+      last_failure_started_at TEXT,
       last_failure TEXT,
       PRIMARY KEY (account_id, channel)
     );
   `);
+  const columns = db.prepare("PRAGMA table_info(inbox_sync_state)").all() as Array<{ name: string }>;
+  for (const name of ["last_success_started_at", "last_failure_started_at"]) {
+    if (!columns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE inbox_sync_state ADD COLUMN ${name} TEXT`);
+    }
+  }
 }
 
 export function recordInboxSyncSuccess(
   db: Database.Database,
-  input: { accountId: string; channel: InboxChannel; completedAt?: string }
+  input: { accountId: string; channel: InboxChannel; startedAt?: string; completedAt?: string }
 ): void {
   const completedAt = input.completedAt ?? new Date().toISOString();
+  const startedAt = input.startedAt ?? completedAt;
   db.prepare(`
-    INSERT INTO inbox_sync_state (account_id, channel, last_successful_at, last_failure_at, last_failure)
-    VALUES (?, ?, ?, NULL, NULL)
+    INSERT INTO inbox_sync_state (account_id, channel, last_successful_at,
+      last_success_started_at, last_failure_at, last_failure_started_at, last_failure)
+    VALUES (?, ?, ?, ?, NULL, NULL, NULL)
     ON CONFLICT(account_id, channel) DO UPDATE SET
-      last_successful_at = excluded.last_successful_at,
-      last_failure_at = NULL,
-      last_failure = NULL
-  `).run(input.accountId, input.channel, completedAt);
+      last_successful_at = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_success_started_at >= inbox_sync_state.last_success_started_at
+        THEN excluded.last_successful_at ELSE inbox_sync_state.last_successful_at END,
+      last_success_started_at = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_success_started_at >= inbox_sync_state.last_success_started_at
+        THEN excluded.last_success_started_at ELSE inbox_sync_state.last_success_started_at END,
+      last_failure_at = CASE WHEN inbox_sync_state.last_failure_started_at IS NULL
+        OR excluded.last_success_started_at > inbox_sync_state.last_failure_started_at
+        THEN NULL ELSE inbox_sync_state.last_failure_at END,
+      last_failure_started_at = CASE WHEN inbox_sync_state.last_failure_started_at IS NULL
+        OR excluded.last_success_started_at > inbox_sync_state.last_failure_started_at
+        THEN NULL ELSE inbox_sync_state.last_failure_started_at END,
+      last_failure = CASE WHEN inbox_sync_state.last_failure_started_at IS NULL
+        OR excluded.last_success_started_at > inbox_sync_state.last_failure_started_at
+        THEN NULL ELSE inbox_sync_state.last_failure END
+  `).run(input.accountId, input.channel, completedAt, startedAt);
 }
 
 export function recordInboxSyncFailure(
   db: Database.Database,
-  input: { accountId: string; channel: InboxChannel; error: string; failedAt?: string }
+  input: { accountId: string; channel: InboxChannel; error: string; startedAt?: string; failedAt?: string }
 ): void {
   const failedAt = input.failedAt ?? new Date().toISOString();
+  const startedAt = input.startedAt ?? failedAt;
   db.prepare(`
-    INSERT INTO inbox_sync_state (account_id, channel, last_failure_at, last_failure)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO inbox_sync_state (account_id, channel, last_failure_at, last_failure_started_at, last_failure)
+    VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(account_id, channel) DO UPDATE SET
-      last_failure_at = excluded.last_failure_at,
-      last_failure = excluded.last_failure
-  `).run(input.accountId, input.channel, failedAt, input.error);
+      last_failure_at = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at
+        THEN excluded.last_failure_at ELSE inbox_sync_state.last_failure_at END,
+      last_failure_started_at = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at
+        THEN excluded.last_failure_started_at ELSE inbox_sync_state.last_failure_started_at END,
+      last_failure = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at
+        THEN excluded.last_failure ELSE inbox_sync_state.last_failure END
+  `).run(input.accountId, input.channel, failedAt, startedAt, input.error);
 }
 
 export function getInboxFreshness(
@@ -66,6 +96,7 @@ export function getInboxFreshness(
   const reason = !lastSuccessfulAt ? "never_synced"
     : lastFailureAt ? "sync_failed"
     : !Number.isFinite(Date.parse(lastSuccessfulAt)) ? "invalid_sync_time"
+    : Date.parse(lastSuccessfulAt) > (input.now ?? new Date()).getTime() + 60_000 ? "future_sync_time"
     : (input.now ?? new Date()).getTime() - Date.parse(lastSuccessfulAt) > input.maxAgeMs ? "stale"
     : null;
   return { fresh: reason === null, reason, lastSuccessfulAt, lastFailureAt };

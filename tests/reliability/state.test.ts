@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
-import { initRelationshipSchema, getRelationship, isConnectedForAccount } from "../../lib/reliability/relationships";
+import {
+  initRelationshipSchema, getRelationship, isConnectedForAccount,
+  recordConnectionRequested, getConnectionRequestedAt,
+  recordMessagingIdentity, getMessagingIdentity,
+} from "../../lib/reliability/relationships";
 import { initInboxStateSchema, recordInboxSyncSuccess, recordInboxSyncFailure, getInboxFreshness } from "../../lib/reliability/inbox-state";
 import { syncAcceptedFromProvider, type ApiConnection, type ConnectionProvider } from "../../lib/linkedin/sync-accepted";
 
@@ -84,4 +91,57 @@ test("inbox failure blocks freshness until complete success", () => {
   recordInboxSyncSuccess(db, { accountId: "ben", channel: "linkedin", completedAt: "2026-10-17T11:50:00Z" });
   assert.equal(query().fresh, true);
   db.close();
+});
+
+test("invitation and messaging identities stay with their sender", () => {
+  const db = database();
+  initRelationshipSchema(db);
+  recordConnectionRequested(db, { accountId: "ben", targetId: "one", requestedAt: "2026-10-17T10:00:00Z" });
+  recordMessagingIdentity(db, { accountId: "ben", targetId: "one", messagingUrn: "urn:ben:alex" });
+  assert.equal(getConnectionRequestedAt(db, "philipp", "one"), null);
+  assert.equal(getMessagingIdentity(db, "philipp", "one"), null);
+  assert.equal(getConnectionRequestedAt(db, "ben", "one"), "2026-10-17T10:00:00Z");
+  assert.equal(getMessagingIdentity(db, "ben", "one"), "urn:ben:alex");
+  db.close();
+});
+
+test("older inbox scan cannot clear newer failure; future timestamp blocks", () => {
+  const db = database();
+  initInboxStateSchema(db);
+  const base = { accountId: "ben", channel: "email" as const };
+  recordInboxSyncFailure(db, { ...base, startedAt: "2026-10-17T11:30:00Z", failedAt: "2026-10-17T11:40:00Z", error: "partial" });
+  recordInboxSyncSuccess(db, { ...base, startedAt: "2026-10-17T11:00:00Z", completedAt: "2026-10-17T11:50:00Z" });
+  const freshness = () => getInboxFreshness(db, { ...base, maxAgeMs: 3600000, now: new Date("2026-10-17T12:00:00Z") });
+  assert.equal(freshness().reason, "sync_failed");
+  recordInboxSyncSuccess(db, { ...base, startedAt: "2026-10-17T11:55:00Z", completedAt: "2026-10-17T12:00:00Z" });
+  assert.equal(freshness().fresh, true);
+  recordInboxSyncSuccess(db, { ...base, startedAt: "2026-10-17T12:05:00Z", completedAt: "2026-10-17T12:05:00Z" });
+  assert.equal(freshness().reason, "future_sync_time");
+  db.close();
+});
+
+test("migration survives two reopens without changing legacy audit or FK integrity", () => {
+  const directory = mkdtempSync(join(tmpdir(), "linki-state-"));
+  const path = join(directory, "state.db");
+  try {
+    const first = new Database(path);
+    first.pragma("foreign_keys = ON");
+    first.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY);
+      CREATE TABLE targets (id TEXT PRIMARY KEY, degree INTEGER, connected_at TEXT, connection_requested_at TEXT);
+      INSERT INTO accounts VALUES ('ben');
+      INSERT INTO targets VALUES ('one', 1, '2026-01-01', '2025-12-01');`);
+    initRelationshipSchema(first);
+    first.close();
+    for (let reopen = 0; reopen < 2; reopen++) {
+      const db = new Database(path);
+      db.pragma("foreign_keys = ON");
+      initRelationshipSchema(db);
+      assert.equal((db.prepare("SELECT COUNT(*) AS n FROM legacy_relationship_audit").get() as { n: number }).n, 1);
+      assert.equal((db.prepare("SELECT COUNT(*) AS n FROM account_relationships").get() as { n: number }).n, 0);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      db.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

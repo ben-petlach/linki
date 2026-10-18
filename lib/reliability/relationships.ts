@@ -20,12 +20,19 @@ export interface Relationship {
 export function initRelationshipSchema(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS account_relationships (
-      account_id TEXT NOT NULL,
-      target_id TEXT NOT NULL,
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
       connected_at TEXT NOT NULL,
       source TEXT NOT NULL,
       profile_id TEXT,
       verified_at TEXT NOT NULL,
+      PRIMARY KEY (account_id, target_id)
+    );
+    CREATE TABLE IF NOT EXISTS account_target_state (
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+      connection_requested_at TEXT,
+      messaging_urn TEXT,
       PRIMARY KEY (account_id, target_id)
     );
     CREATE TABLE IF NOT EXISTS legacy_relationship_audit (
@@ -34,6 +41,11 @@ export function initRelationshipSchema(db: Database.Database): void {
       connected_at TEXT,
       connection_requested_at TEXT,
       captured_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS connection_sync_state (
+      account_id TEXT PRIMARY KEY,
+      last_failure_at TEXT,
+      last_error TEXT
     );
   `);
   // Old target fields have no sender identity. Preserve them for audit only.
@@ -81,4 +93,48 @@ export function isConnectedForAccount(
   db: Database.Database, accountId: string, targetId: string
 ): boolean {
   return getRelationship(db, accountId, targetId) !== null;
+}
+
+export function clearConnectedEvidence(
+  db: Database.Database, accountId: string, targetId: string
+): void {
+  db.prepare("DELETE FROM account_relationships WHERE account_id = ? AND target_id = ?")
+    .run(accountId, targetId);
+}
+
+export function recordConnectionRequested(
+  db: Database.Database,
+  input: { accountId: string; targetId: string; requestedAt: string }
+): void {
+  db.prepare(`INSERT INTO account_target_state (account_id, target_id, connection_requested_at)
+    VALUES (?, ?, ?) ON CONFLICT(account_id, target_id) DO UPDATE SET
+    connection_requested_at = COALESCE(account_target_state.connection_requested_at,
+      excluded.connection_requested_at)`).run(input.accountId, input.targetId, input.requestedAt);
+}
+
+export function getConnectionRequestedAt(
+  db: Database.Database, accountId: string, targetId: string
+): string | null {
+  const row = db.prepare(`SELECT connection_requested_at AS requestedAt
+    FROM account_target_state WHERE account_id = ? AND target_id = ?`).get(accountId, targetId) as
+    { requestedAt: string | null } | undefined;
+  return row?.requestedAt ?? null;
+}
+
+export function recordMessagingIdentity(
+  db: Database.Database,
+  input: { accountId: string; targetId: string; messagingUrn: string }
+): void {
+  db.prepare(`INSERT INTO account_target_state (account_id, target_id, messaging_urn)
+    VALUES (?, ?, ?) ON CONFLICT(account_id, target_id) DO UPDATE SET
+    messaging_urn = excluded.messaging_urn`).run(input.accountId, input.targetId, input.messagingUrn);
+}
+
+export function getMessagingIdentity(
+  db: Database.Database, accountId: string, targetId: string
+): string | null {
+  const row = db.prepare(`SELECT messaging_urn AS messagingUrn
+    FROM account_target_state WHERE account_id = ? AND target_id = ?`).get(accountId, targetId) as
+    { messagingUrn: string | null } | undefined;
+  return row?.messagingUrn ?? null;
 }

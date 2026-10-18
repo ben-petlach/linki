@@ -22,6 +22,10 @@ export interface ConnectionProvider {
 
 export function shouldSyncAccepted(accountId: string): boolean {
   const db = getDb();
+  initRelationshipSchema(db);
+  const failure = db.prepare(`SELECT last_failure_at FROM connection_sync_state
+    WHERE account_id = ?`).get(accountId) as { last_failure_at: string | null } | undefined;
+  if (failure?.last_failure_at) return true;
   const row = db.prepare("SELECT accepted_sync_at FROM accounts WHERE id = ?").get(accountId) as
     | { accepted_sync_at: string | null } | undefined;
   if (!row?.accepted_sync_at) return true;
@@ -84,35 +88,47 @@ export async function syncAcceptedFromProvider(
     db.prepare(`UPDATE accounts SET accepted_sync_at = datetime('now'),
       connections_synced_through_ms = ?, li_connections = ? WHERE id = ?`).run(
       Math.max(0, ...Array.from(byProfile.values(), (c) => c.createdAt)), declaredTotal, accountId);
+    db.prepare(`INSERT INTO connection_sync_state (account_id, last_failure_at, last_error)
+      VALUES (?, NULL, NULL) ON CONFLICT(account_id) DO UPDATE SET
+      last_failure_at = NULL, last_error = NULL`).run(accountId);
   })();
   return recorded;
 }
 
 export async function syncAcceptedConnections(accountId: string): Promise<number> {
   const db = getDb();
-  const page = await getSessionPage(accountId);
+  let page: Page | undefined;
   try {
-    await page.goto("https://www.linkedin.com/mynetwork/invite-connect/connections/", {
+    const sessionPage = await getSessionPage(accountId);
+    page = sessionPage;
+    await sessionPage.goto("https://www.linkedin.com/mynetwork/invite-connect/connections/", {
       waitUntil: "domcontentloaded", timeout: 35000,
     });
-    await page.waitForTimeout(3500);
-    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(page.url())) {
+    await sessionPage.waitForTimeout(3500);
+    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(sessionPage.url())) {
       await markNeedsReauth(accountId);
       throw new Error("LinkedIn session requires authentication");
     }
     const provider: ConnectionProvider = {
-      getDeclaredTotal: () => page.evaluate(() => {
+      getDeclaredTotal: () => sessionPage.evaluate(() => {
         const match = document.body.innerText.match(/([\d.,]+)\s+connections?/i);
         return match ? Number(match[1].replace(/[.,]/g, "")) : null;
       }),
-      getPage: (start, count) => fetchConnectionsPage(page, start, count),
+      getPage: (start, count) => fetchConnectionsPage(sessionPage, start, count),
     };
     const recorded = await syncAcceptedFromProvider(db, accountId, provider);
     await saveSessionState(accountId);
     return recorded;
+  } catch (error) {
+    initRelationshipSchema(db);
+    db.prepare(`INSERT INTO connection_sync_state (account_id, last_failure_at, last_error)
+      VALUES (?, datetime('now'), ?) ON CONFLICT(account_id) DO UPDATE SET
+      last_failure_at = excluded.last_failure_at, last_error = excluded.last_error`).run(
+      accountId, error instanceof Error ? error.message : String(error));
+    throw error;
   } finally {
-    const url = page.url();
-    await page.close().catch(() => {});
+    const url = page?.url() ?? "";
+    await page?.close().catch(() => {});
     if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(url)) {
       await markNeedsReauth(accountId).catch(() => {});
     }
@@ -121,7 +137,9 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
 
 function vanityFromUrl(url: string): string | null {
   try {
-    const path = new URL(url).pathname.match(/^\/in\/([^/]+)\/?$/);
+    const parsed = new URL(url);
+    if (parsed.hostname !== "linkedin.com" && parsed.hostname !== "www.linkedin.com") return null;
+    const path = parsed.pathname.match(/^\/in\/([^/]+)\/?$/);
     return path ? decodeURIComponent(path[1]).toLowerCase() : null;
   } catch {
     return null;
