@@ -7,7 +7,7 @@ import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { syncLinkedInInbox } from "@/lib/linkedin/inbox";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { sendEmail } from "@/lib/email/sender";
-import { shouldSyncEmailInbox, syncEmailInbox } from "@/lib/email/inbox";
+import { shouldSyncEmailInbox, syncEmailInbox, MAX_EMAIL_INBOX_AGE_MS } from "@/lib/email/inbox";
 import { registerOutboundEmail, markOutboundAccepted } from "@/lib/email/inbox";
 import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
@@ -15,7 +15,7 @@ import { premium } from "@/lib/premium";
 import { decryptSecret } from "@/lib/crypto";
 import { actionKey, beginDispatch, claimAction, confirmAction, getAction, holdUnknown, releaseClaim } from "@/lib/reliability/actions";
 import { isConnectedForAccount, recordConnectedEvidence, recordConnectionRequested, getConnectionRequestedAt, recordMessagingIdentity, getMessagingIdentity, clearConnectedEvidence } from "@/lib/reliability/relationships";
-import { getInboxFreshness } from "@/lib/reliability/inbox-state";
+import { getInboxFreshness, recordInboxSyncFailure } from "@/lib/reliability/inbox-state";
 import { evaluateEligibility } from "@/lib/reliability/suppression";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
@@ -320,11 +320,19 @@ export async function dispatchStep<T>(
       if (reply?.last_replied_at || reply?.email_replied_at) return "lead replied";
       const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin", checkNetNewRules: true });
       if (!suppression.allowed) return `suppressed: ${suppression.blocks.map(b => b.reason).join(", ")}`;
-      const inbox = getInboxFreshness(db, {
-        accountId: senderId, channel: channel === "email" ? "email" : "linkedin",
-        maxAgeMs: channel === "email" ? 3 * 60 * 60_000 : 30 * 60_000,
-      });
-      if (!inbox.fresh) return `inbox ${inbox.reason}`;
+      // Any channel configured for this profile can still receive a reply,
+      // including a completed track. Check every relevant sender before sending.
+      const tracks = db.prepare("SELECT DISTINCT track FROM run_profile_tracks WHERE run_profile_id = ?")
+        .all(tr.run_profile_id) as Array<{ track: "linkedin" | "email" }>;
+      for (const relevant of tracks) {
+        const relevantSender = relevant.track === "linkedin" ? assignment.account_id : assignment.email_account_id;
+        if (!relevantSender) continue;
+        const inbox = getInboxFreshness(db, {
+          accountId: relevantSender, channel: relevant.track,
+          maxAgeMs: relevant.track === "email" ? MAX_EMAIL_INBOX_AGE_MS : 30 * 60_000,
+        });
+        if (!inbox.fresh) return `${relevant.track} inbox ${inbox.reason}`;
+      }
       if (channel === "message" && !isConnectedForAccount(db, senderId, target.id)) return "sender has no verified connection";
       const used = (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
         WHERE sender_id = ? AND channel = ? AND state IN ('sending','confirmed','unknown')
@@ -363,6 +371,9 @@ export async function dispatchStep<T>(
     }
     holdUnknown(db, key, token, reason);
     trFail(db, tr, `Action ${key} outcome unknown; review required: ${reason}`);
+    if (error instanceof WeeklyLimitError) {
+      db.prepare("UPDATE runs SET status = 'paused' WHERE account_id = ? AND status = 'running'").run(senderId);
+    }
     return "held";
   }
 }
@@ -1069,7 +1080,10 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
 
   // Complete public inbox sync provides reply evidence and freshness before sends.
   for (const accountId of seenAccounts) {
-    if (!getInboxFreshness(db, { accountId, channel: "linkedin", maxAgeMs: 15 * 60_000 }).fresh) {
+    const freshness = getInboxFreshness(db, { accountId, channel: "linkedin", maxAgeMs: 15 * 60_000 });
+    // A failed session/checkpoint should not be hit every 30-second tick.
+    const failedRecently = freshness.lastFailureAt && Date.now() - Date.parse(freshness.lastFailureAt) < 15 * 60_000;
+    if (!freshness.fresh && !failedRecently) {
       try {
         console.log(`[runner] Starting LinkedIn inbox sync for account ${accountId}`);
         const page = await getSessionPage(accountId);
@@ -1083,6 +1097,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
           }
         }
       } catch (e) {
+        recordInboxSyncFailure(db, { accountId, channel: "linkedin", error: e instanceof Error ? e.message : String(e) });
         console.warn("[runner] LinkedIn inbox sync error:", e instanceof Error ? e.message : e);
       }
     }
