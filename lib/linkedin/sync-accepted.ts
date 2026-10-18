@@ -34,9 +34,12 @@ export function shouldSyncAccepted(accountId: string): boolean {
 
 /** Complete positive evidence only. Partial passes never write a success marker. */
 export async function syncAcceptedFromProvider(
-  db: Database.Database, accountId: string, provider: ConnectionProvider
+  db: Database.Database, accountId: string, provider: ConnectionProvider, stillOwnsLease?: () => boolean
 ): Promise<number> {
-  initRelationshipSchema(db);
+  db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Connections lease lost");
+    initRelationshipSchema(db);
+  }).immediate();
   const declaredTotal = await provider.getDeclaredTotal();
   if (declaredTotal === null || !Number.isSafeInteger(declaredTotal) || declaredTotal < 0) {
     throw new Error("Connections total unavailable");
@@ -74,6 +77,7 @@ export async function syncAcceptedFromProvider(
   }
   let recorded = 0;
   db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Connections lease lost");
     for (const connection of byProfile.values()) {
       if (!connection.vanity) continue;
       const ids = targetsByVanity.get(connection.vanity.toLowerCase()) ?? [];
@@ -91,11 +95,11 @@ export async function syncAcceptedFromProvider(
     db.prepare(`INSERT INTO connection_sync_state (account_id, last_failure_at, last_error)
       VALUES (?, NULL, NULL) ON CONFLICT(account_id) DO UPDATE SET
       last_failure_at = NULL, last_error = NULL`).run(accountId);
-  })();
+  }).immediate();
   return recorded;
 }
 
-export async function syncAcceptedConnections(accountId: string): Promise<number> {
+export async function syncAcceptedConnections(accountId: string, stillOwnsLease?: () => boolean): Promise<number> {
   const db = getDb();
   let page: Page | undefined;
   try {
@@ -106,7 +110,7 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
     });
     await sessionPage.waitForTimeout(3500);
     if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(sessionPage.url())) {
-      await markNeedsReauth(accountId);
+      if (!stillOwnsLease || stillOwnsLease()) await markNeedsReauth(accountId, stillOwnsLease);
       throw new Error("LinkedIn session requires authentication");
     }
     const provider: ConnectionProvider = {
@@ -116,21 +120,25 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
       }),
       getPage: (start, count) => fetchConnectionsPage(sessionPage, start, count),
     };
-    const recorded = await syncAcceptedFromProvider(db, accountId, provider);
-    await saveSessionState(accountId);
+    const recorded = await syncAcceptedFromProvider(db, accountId, provider, stillOwnsLease);
+    if (!stillOwnsLease || stillOwnsLease()) await saveSessionState(accountId, stillOwnsLease);
     return recorded;
   } catch (error) {
-    initRelationshipSchema(db);
-    db.prepare(`INSERT INTO connection_sync_state (account_id, last_failure_at, last_error)
+    db.transaction(() => {
+      if (!stillOwnsLease || stillOwnsLease()) {
+        initRelationshipSchema(db);
+        db.prepare(`INSERT INTO connection_sync_state (account_id, last_failure_at, last_error)
       VALUES (?, datetime('now'), ?) ON CONFLICT(account_id) DO UPDATE SET
       last_failure_at = excluded.last_failure_at, last_error = excluded.last_error`).run(
-      accountId, error instanceof Error ? error.message : String(error));
+          accountId, error instanceof Error ? error.message : String(error));
+      }
+    }).immediate();
     throw error;
   } finally {
     const url = page?.url() ?? "";
     await page?.close().catch(() => {});
-    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(url)) {
-      await markNeedsReauth(accountId).catch(() => {});
+    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(url) && (!stillOwnsLease || stillOwnsLease())) {
+      await markNeedsReauth(accountId, stillOwnsLease).catch(() => {});
     }
   }
 }

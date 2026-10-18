@@ -32,13 +32,21 @@ export function claimPoll(db: Database.Database, channel: PollChannel, accountId
   }).immediate();
 }
 
+export function stillOwnsPoll(db: Database.Database, channel: PollChannel, accountId: string, token: string, now = new Date()): boolean {
+  const row = db.prepare(`SELECT 1 AS owned FROM scheduler_poll_state
+    WHERE channel = ? AND account_id = ? AND token = ? AND lease_until > ?`).get(
+      channel, accountId, token, now.toISOString()) as { owned: number } | undefined;
+  return row?.owned === 1;
+}
+
 export function completePoll(
   db: Database.Database, channel: PollChannel, accountId: string, token: string,
   result: { error?: string }, now = new Date()
 ): boolean {
   return db.transaction(() => {
     const row = db.prepare(`SELECT consecutive_failures FROM scheduler_poll_state
-      WHERE channel = ? AND account_id = ? AND token = ?`).get(channel, accountId, token) as { consecutive_failures: number } | undefined;
+      WHERE channel = ? AND account_id = ? AND token = ? AND lease_until > ?`).get(
+        channel, accountId, token, now.toISOString()) as { consecutive_failures: number } | undefined;
     if (!row) return false;
     const failures = result.error ? row.consecutive_failures + 1 : 0;
     const base = channel === "linkedin" ? 15 * 60_000 : channel === "connections" ? 23 * 60 * 60_000 : 2 * 60_000;

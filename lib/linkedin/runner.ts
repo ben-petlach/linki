@@ -1,5 +1,5 @@
 import { getDb } from "@/lib/db";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
 import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
@@ -16,7 +16,7 @@ import { decryptSecret } from "@/lib/crypto";
 import { actionKey, beginDispatch, claimAction, confirmAction, getAction, holdUnknown, releaseClaim } from "@/lib/reliability/actions";
 import { isConnectedForAccount, recordConnectedEvidence, recordConnectionRequested, getConnectionRequestedAt, recordMessagingIdentity, getMessagingIdentity, clearConnectedEvidence } from "@/lib/reliability/relationships";
 import { getInboxFreshness, recordInboxSyncFailure } from "@/lib/reliability/inbox-state";
-import { claimPoll, completePoll } from "@/lib/reliability/scheduler";
+import { claimPoll, completePoll, stillOwnsPoll } from "@/lib/reliability/scheduler";
 import { evaluateOperationAlerts, getDispatchBlockReason, recordWorkerHeartbeat } from "@/lib/reliability/operations";
 import { getProviderDispatchBlockReason } from "@/lib/reliability/provider-health";
 import { evaluateEligibility } from "@/lib/reliability/suppression";
@@ -287,7 +287,7 @@ export async function dispatchStep<T>(
   const senderTable = channel === "email" ? "email_accounts" : "accounts";
   const senderIdentity = (db.prepare(`SELECT ${channel === "email" ? "from_email" : "email"} AS identity FROM ${senderTable} WHERE id = ?`)
     .get(senderId) as { identity: string } | undefined)?.identity.trim().toLowerCase();
-  const claim = claimAction(db, { key, senderId, targetId: target.id, channel, payload });
+  const claim = claimAction(db, { key, senderId, targetId: target.id, channel, payload, recipientIdentity });
   if (!claim.claimed) {
     if (claim.state === "confirmed") return "confirmed";
     if (claim.state === "claimed") return "deferred";
@@ -383,7 +383,8 @@ export async function dispatchStep<T>(
   };
   try {
     const result = await send(beforeSend, finalEligibility);
-    if (getAction(db, key)?.state !== "sending") throw new Error("adapter returned without crossing dispatch gate");
+    const state = getAction(db, key)?.state;
+    if (state !== "sending" && state !== "confirmed") throw new Error("adapter returned without crossing dispatch gate");
     const proof = evidence(result);
     if (!proof || !confirmAction(db, key, token, proof)) throw new Error("provider acceptance not confirmed");
     return "sent";
@@ -973,7 +974,7 @@ async function executeStep(
       const finalEmailBody = sig ? `${emailBody}\n\n--\n${sig}` : emailBody;
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending email to ${name} <${freshTarget.email}>`);
-      const messageId = `<${randomUUID()}@${emailAccount.from_email.split("@")[1]}>`;
+      const messageId = `<${createHash("sha256").update(actionKey(tr.id, step.id)).digest("hex")}@${emailAccount.from_email.split("@")[1]}>`;
       const dispatched = await dispatchStep(db, tr, step, target, emailAccountId, "email", hardLimit, emailAccountLimits, JSON.stringify({ emailSubject, emailBody }), freshTarget.email,
         async beforeSend => {
           registerOutboundEmail(db, {
@@ -1076,9 +1077,9 @@ async function globalLoop(): Promise<void> {
 
 export interface RunnerDependencies {
   now?: () => Date;
-  syncLinkedInInbox?: (db: ReturnType<typeof getDb>, accountId: string) => Promise<number>;
-  syncEmailInbox?: (accountId: string, db: ReturnType<typeof getDb>) => Promise<{ replies: number; bounces: number }>;
-  syncAcceptedConnections?: (accountId: string) => Promise<number>;
+  syncLinkedInInbox?: (db: ReturnType<typeof getDb>, accountId: string, stillOwnsLease?: () => boolean) => Promise<number>;
+  syncEmailInbox?: (accountId: string, db: ReturnType<typeof getDb>, stillOwnsLease?: () => boolean) => Promise<{ replies: number; bounces: number }>;
+  syncAcceptedConnections?: (accountId: string, stillOwnsLease?: () => boolean) => Promise<number>;
   executeStep?: typeof executeStep;
   sleep?: (ms: number) => Promise<void>;
   pollTimeoutMs?: number;
@@ -1094,9 +1095,9 @@ async function pollInboxes(db: ReturnType<typeof getDb>, deps: RunnerDependencie
   const now = deps.now ?? (() => new Date());
   const linkedinAccounts = db.prepare("SELECT id FROM accounts WHERE is_authenticated = 1 ORDER BY id").all() as { id: string }[];
   const emailAccounts = db.prepare("SELECT id FROM email_accounts WHERE imap_host IS NOT NULL ORDER BY id").all() as { id: string }[];
-  const linkedinSync = deps.syncLinkedInInbox ?? (async (database, accountId) => {
+  const linkedinSync = deps.syncLinkedInInbox ?? (async (database, accountId, stillOwnsLease) => {
     const page = await getSessionPage(accountId);
-    try { return await syncLinkedInInbox(database, accountId, page); }
+    try { return await syncLinkedInInbox(database, accountId, page, stillOwnsLease); }
     finally { await page.close(); }
   });
   const emailSync = deps.syncEmailInbox ?? syncEmailInbox;
@@ -1111,11 +1112,15 @@ async function pollInboxes(db: ReturnType<typeof getDb>, deps: RunnerDependencie
     const token = linkedinStarted < 4 ? claimPoll(db, "linkedin", id, new Date(startedAt)) : null;
     if (token) polls.push((async () => {
       try {
-        await linkedinSync(db, id);
+        const owns = () => stillOwnsPoll(db, "linkedin", id, token, now());
+        await linkedinSync(db, id, owns);
         completePoll(db, "linkedin", id, token, {}, now());
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        recordInboxSyncFailure(db, { accountId: id, channel: "linkedin", error: reason, startedAt });
+        db.transaction(() => {
+          if (stillOwnsPoll(db, "linkedin", id, token, now()))
+            recordInboxSyncFailure(db, { accountId: id, channel: "linkedin", error: reason, startedAt });
+        }).immediate();
         completePoll(db, "linkedin", id, token, { error: reason }, now());
         console.warn(`[runner] LinkedIn inbox ${id}: ${reason}`);
       }
@@ -1124,7 +1129,7 @@ async function pollInboxes(db: ReturnType<typeof getDb>, deps: RunnerDependencie
     const connectionsToken = acceptedStarted < 2 ? claimPoll(db, "connections", id, now()) : null;
     if (connectionsToken) polls.push((async () => {
       try {
-        await acceptedSync(id);
+        await acceptedSync(id, () => stillOwnsPoll(db, "connections", id, connectionsToken, now()));
         completePoll(db, "connections", id, connectionsToken, {}, now());
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
@@ -1140,11 +1145,14 @@ async function pollInboxes(db: ReturnType<typeof getDb>, deps: RunnerDependencie
     const token = claimPoll(db, "email", id, new Date(startedAt));
     if (token) polls.push((async () => {
       try {
-        await emailSync(id, db);
+        await emailSync(id, db, () => stillOwnsPoll(db, "email", id, token, now()));
         completePoll(db, "email", id, token, {}, now());
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        recordInboxSyncFailure(db, { accountId: id, channel: "email", error: reason, startedAt });
+        db.transaction(() => {
+          if (stillOwnsPoll(db, "email", id, token, now()))
+            recordInboxSyncFailure(db, { accountId: id, channel: "email", error: reason, startedAt });
+        }).immediate();
         completePoll(db, "email", id, token, { error: reason }, now());
         console.warn(`[runner] Email inbox ${id}: ${reason}`);
       }

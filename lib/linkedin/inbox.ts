@@ -292,8 +292,11 @@ export function initLinkedInInboxSchema(db: Database.Database): void {
 }
 
 /** Public-build reply sync; only a fully paged scan refreshes inbox state. */
-export async function syncLinkedInInbox(db: Database.Database, accountId: string, page: Page): Promise<number> {
-  initLinkedInInboxSchema(db);
+export async function syncLinkedInInbox(db: Database.Database, accountId: string, page: Page, stillOwnsLease?: () => boolean): Promise<number> {
+  db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
+    initLinkedInInboxSchema(db);
+  }).immediate();
   const startedAt = new Date().toISOString();
   try {
     const legacy = db.prepare(`SELECT t.id FROM targets t
@@ -320,6 +323,7 @@ export async function syncLinkedInInbox(db: Database.Database, accountId: string
       { id: string; linkedin_url: string; first_sent_at: string | null }[];
     let newReplies = 0;
     db.transaction(() => {
+      if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
       for (const event of events) {
         const matches = rows.filter((row) => normalizedProfileUrl(row.linkedin_url) === event.profileUrl);
         if (matches.length > 1) throw new IncompleteLinkedInInboxError(`Ambiguous target identity: ${event.profileUrl}`);
@@ -337,11 +341,13 @@ export async function syncLinkedInInbox(db: Database.Database, accountId: string
         newReplies++;
       }
       recordInboxSyncSuccess(db, { accountId, channel: "linkedin", startedAt });
-    })();
+    }).immediate();
     return newReplies;
   } catch (error) {
-    recordInboxSyncFailure(db, { accountId, channel: "linkedin", startedAt,
-      error: error instanceof Error ? error.message : String(error) });
+    db.transaction(() => {
+      if (!stillOwnsLease || stillOwnsLease()) recordInboxSyncFailure(db, { accountId, channel: "linkedin", startedAt,
+        error: error instanceof Error ? error.message : String(error) });
+    }).immediate();
     throw error;
   }
 }
