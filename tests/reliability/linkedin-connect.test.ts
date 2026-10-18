@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { sendConnectionRequest, UnconfirmedConnectionError } from "../../lib/linkedin/connect";
 
-const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const chrome = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ??
+  (process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : undefined);
 const target = "https://www.linkedin.com/in/alex-smith";
 
 async function fixture(confirmPending: boolean) {
@@ -32,5 +33,15 @@ test("click without pending evidence remains unconfirmed", async () => {
   const { browser, page } = await fixture(false);
   try {
     await assert.rejects(sendConnectionRequest(page, target), UnconfirmedConnectionError);
+  } finally { await browser.close(); }
+});
+
+test("final policy gate can stop an invitation before confirmation", async () => {
+  const { browser, page } = await fixture(true);
+  try {
+    await assert.rejects(sendConnectionRequest(page, target, () => {
+      throw new Error("suppressed");
+    }), /suppressed/);
+    assert.equal(await page.locator('button[aria-label="Pending invitation"]').count(), 0);
   } finally { await browser.close(); }
 });

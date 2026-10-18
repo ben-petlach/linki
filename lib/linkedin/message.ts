@@ -1,5 +1,6 @@
 import type { Page } from "playwright";
 import { LinkedInLayoutError, normalizedProfileUrl, visitProfile } from "./visit";
+import { outboundMessageIds } from "./inbox";
 
 export class NotConnectedError extends Error {}
 /** A click may have reached LinkedIn. Callers must hold for review, never retry blindly. */
@@ -17,8 +18,10 @@ export async function sendMessage(
   fullName: string,
   text: string,
   linkedinUrl: string,
-  _cachedMessagingUrn?: string | null
+  _cachedMessagingUrn?: string | null,
+  beforeSend?: () => void
 ): Promise<SendMessageResult> {
+  void _cachedMessagingUrn; // Kept for caller compatibility; only fresh profile evidence is trusted.
   const identity = normalizedProfileUrl(linkedinUrl);
   if (!identity) throw new LinkedInLayoutError("Target has no exact LinkedIn profile URL");
   const live = await visitProfile(page, identity);
@@ -34,7 +37,7 @@ export async function sendMessage(
   }
 
   // The compose UI must independently confirm the recipient's exact profile.
-  const recipientLinks = page.locator('.msg-compose-recipient a[href*="/in/"], .msg-thread__link-to-profile[href*="/in/"]');
+  const recipientLinks = page.locator('.profile-card-one-to-one__profile-link[href*="/in/"]');
   const recipients = await recipientLinks.evaluateAll((nodes) =>
     nodes.map((node) => (node as HTMLAnchorElement).href)
   );
@@ -47,29 +50,28 @@ export async function sendMessage(
   if (await msgInput.count() !== 1 || await sendBtn.count() !== 1) {
     throw new LinkedInLayoutError("LinkedIn compose controls missing or ambiguous");
   }
-  const outbound = page.locator('.msg-s-message-list__event--outbound[data-event-id], [data-message-direction="outbound"][data-event-id]');
-  const matchingCount = async () => (await outbound.allInnerTexts()).filter((body) => body.trim() === text.trim()).length;
-  const before = await matchingCount();
+  let before: Set<string>;
+  try {
+    before = await outboundMessageIds(page, identity, text);
+  } catch (error) {
+    throw new LinkedInLayoutError(`Cannot establish LinkedIn outbound baseline: ${error instanceof Error ? error.message : String(error)}`);
+  }
   await msgInput.fill(text);
   if ((await msgInput.innerText()).trim() !== text.trim()) {
     throw new LinkedInLayoutError("Composed message differs from requested text");
   }
+  beforeSend?.();
   await sendBtn.click();
 
-  try {
-    await page.waitForFunction(({ expected, previous }) => {
-      const nodes = Array.from(document.querySelectorAll(
-        '.msg-s-message-list__event--outbound[data-event-id], [data-message-direction="outbound"][data-event-id]'
-      ));
-      return nodes.filter((node) => node.textContent?.trim() === expected).length > previous;
-    }, { expected: text.trim(), previous: before }, { timeout: 8000 });
-  } catch {
-    throw new UnconfirmedSendError("Send clicked but matching outbound message was not observed");
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const after = await outboundMessageIds(page, identity, text);
+      const evidence = [...after].find((id) => !before.has(id));
+      if (evidence) return { messagingUrn: live.messagingUrn, isFirstDegree: true, evidence };
+    } catch {
+      // The click may have reached LinkedIn; retain the unknown outcome.
+    }
+    if (attempt < 3) await page.waitForTimeout(1500);
   }
-  const matching = await outbound.evaluateAll((nodes, expected) => nodes
-    .filter((node) => node.textContent?.trim() === expected)
-    .map((node) => node.getAttribute("data-event-id") ?? ""), text.trim());
-  const evidence = matching.at(-1);
-  if (!evidence) throw new UnconfirmedSendError("Outbound message has no provider event identity");
-  return { messagingUrn: live.messagingUrn, isFirstDegree: true, evidence };
+  throw new UnconfirmedSendError("Send clicked but no new matching LinkedIn outbound event was observed");
 }

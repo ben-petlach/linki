@@ -7,7 +7,7 @@ export class PendingInviteError extends Error {}
 /** An invitation click may have reached LinkedIn. Hold for review. */
 export class UnconfirmedConnectionError extends Error {}
 
-export async function sendConnectionRequest(page: Page, linkedinUrl: string): Promise<{ evidence: string }> {
+export async function sendConnectionRequest(page: Page, linkedinUrl: string, beforeSend?: () => void): Promise<{ evidence: string }> {
   const identity = normalizedProfileUrl(linkedinUrl);
   if (!identity) throw new LinkedInLayoutError("Target has no exact LinkedIn profile URL");
   await page.goto(identity, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -35,6 +35,7 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string): Pr
 
   const send = page.locator('button:has-text("Send now"), button[aria-label*="Send without"], button[aria-label*="Send invitation"]:not([aria-label*="note"])');
   if (await send.count() !== 1) throw new LinkedInLayoutError("Invitation confirmation control missing or ambiguous");
+  beforeSend?.();
   await send.click();
   const limitPopup = page.locator('div[class*="ip-fuse-limit-alert__warning"]');
   if (await limitPopup.count()) throw new WeeklyLimitError("Weekly connection limit reached");
