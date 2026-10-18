@@ -16,6 +16,8 @@ RUN npm ci
 # snapshot would freeze security updates and is not a safe fingerprint strategy.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npx playwright install --with-deps chromium \
+    && apt-get purge -y xvfb xserver-xorg-core \
+    && apt-get autoremove -y --purge \
     && chmod -R a+rX /ms-playwright \
     && rm -rf /var/lib/apt/lists/*
 

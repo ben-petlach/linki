@@ -1,6 +1,6 @@
 # Release and restore operations
 
-This package has no production deployment or live-provider validation. The container is built from this fork. `docker-compose.yml` no longer pulls `moaljumaa/linki:latest`. Its Node 22 Debian 13 base is pinned by digest and refreshed with available OS security updates; Playwright installs the Chromium revision in `package-lock.json`. Runtime image removes npm's build-only package manager. CI must rebuild, run browser smoke tests, and scan OS/browser packages on every release. A browser update can invalidate LinkedIn cookies; reauthenticate under the new browser before an approved pilot.
+This package has no production deployment or live-provider validation. The container is built from this fork. `docker-compose.yml` no longer pulls `moaljumaa/linki:latest`. Its Node 22 Debian 13 base is pinned by digest and refreshed with available OS security updates; Playwright installs the Chromium revision in `package-lock.json`. Headless runtime removes Xvfb and its server packages after browser installation; the image also removes npm's build-only package manager. CI must rebuild, run browser smoke tests, and scan OS/browser packages on every release. A browser update can invalidate LinkedIn cookies; reauthenticate under the new browser before an approved pilot.
 
 ## Runtime contract
 
