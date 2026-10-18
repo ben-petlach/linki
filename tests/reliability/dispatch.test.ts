@@ -19,6 +19,7 @@ test("stable action key and expired pre-dispatch claim recover with new fencing 
   assert.deepEqual(beginDispatch(db, key, first.token, () => null, 112), { started: false, reason: "claim lost or expired" });
   assert.deepEqual(beginDispatch(db, key, second.token, () => null, 112), { started: true });
   assert.equal(getAction(db, key)?.state, "sending");
+  assert.ok(getAction(db, key)?.dispatched_at);
   db.close();
 });
 

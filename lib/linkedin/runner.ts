@@ -283,6 +283,9 @@ export async function dispatchStep<T>(
   send: (beforeSend: () => void) => Promise<T>, evidence: (result: T) => string
 ): Promise<"sent" | "confirmed" | "held" | "deferred"> {
   const key = actionKey(tr.id, step.id);
+  const senderTable = channel === "email" ? "email_accounts" : "accounts";
+  const senderIdentity = (db.prepare(`SELECT ${channel === "email" ? "from_email" : "email"} AS identity FROM ${senderTable} WHERE id = ?`)
+    .get(senderId) as { identity: string } | undefined)?.identity.trim().toLowerCase();
   const claim = claimAction(db, { key, senderId, targetId: target.id, channel, payload });
   if (!claim.claimed) {
     if (claim.state === "confirmed") return "confirmed";
@@ -297,11 +300,11 @@ export async function dispatchStep<T>(
       if (run?.status !== "running") return "run paused";
       if (!isWithinSchedule(schedule)) return "outside sender schedule";
       if (channel === "email") {
-        const sender = db.prepare("SELECT is_verified FROM email_accounts WHERE id = ?").get(senderId) as { is_verified: number } | undefined;
-        if (!sender?.is_verified) return "email sender not verified";
+        const sender = db.prepare("SELECT is_verified, from_email AS identity FROM email_accounts WHERE id = ?").get(senderId) as { is_verified: number; identity: string } | undefined;
+        if (!sender?.is_verified || !senderIdentity || sender.identity.trim().toLowerCase() !== senderIdentity) return "email sender changed or not verified";
       } else {
-        const sender = db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(senderId) as { is_authenticated: number } | undefined;
-        if (!sender?.is_authenticated) return "LinkedIn sender not authenticated";
+        const sender = db.prepare("SELECT is_authenticated, email AS identity FROM accounts WHERE id = ?").get(senderId) as { is_authenticated: number; identity: string } | undefined;
+        if (!sender?.is_authenticated || !senderIdentity || sender.identity.trim().toLowerCase() !== senderIdentity) return "LinkedIn sender changed or not authenticated";
       }
       const track = db.prepare("SELECT state, current_step FROM run_profile_tracks WHERE id = ?").get(tr.id) as { state: string; current_step: number } | undefined;
       if (track?.state !== "in_progress" || track.current_step !== tr.current_step) return "step changed";
@@ -325,7 +328,7 @@ export async function dispatchStep<T>(
       if (channel === "message" && !isConnectedForAccount(db, senderId, target.id)) return "sender has no verified connection";
       const used = (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
         WHERE sender_id = ? AND channel = ? AND state IN ('sending','confirmed','unknown')
-        AND date(created_at) = date('now')`).get(senderId, channel) as { count: number }).count;
+        AND date(dispatched_at) = date('now')`).get(senderId, channel) as { count: number }).count;
       const legacyMessage = channel === "connect" ? "Connection request sent%" :
         channel === "message" ? "Message sent%" : channel === "sales_inmail" ? "InMail sent%" : "Email sent%";
       const legacy = channel === "email"
@@ -334,8 +337,8 @@ export async function dispatchStep<T>(
             .get(legacyMessage, senderId) as { count: number }).count
         : (db.prepare(`SELECT COUNT(*) AS count FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
             AND message LIKE ? AND date(created_at) = date('now')`).get(senderId, legacyMessage) as { count: number }).count;
-      // Legacy logs and action rows can overlap. Double counting is conservative;
-      // it may defer a send, but cannot push an account past its cap.
+      // Both legacy logs and action dispatch times use SQLite UTC day. Unknown
+      // outcomes reserve capacity for that day. Overlap double counts safely.
       if (used + legacy >= limit) return "daily limit reached";
       return null;
     });
@@ -654,7 +657,6 @@ async function executeStep(
     } else if (step.step_type === "connect") {
       if (!enforceSchedule(db, tr, runId, target.id, name, accountLimits)) return;
 
-      const freshTarget = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
       if (isConnectedForAccount(db, accountId, target.id)) {
         log(db, runId, target.id, "info", `${name} already connected — skipping connect step`);
         trAdvance(db, tr, steps);

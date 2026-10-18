@@ -7,6 +7,7 @@ export interface ActionRecord {
   state: ActionState;
   token: string;
   lease_until: number | null;
+  dispatched_at: string | null;
   sender_id: string;
   target_id: string;
   channel: string;
@@ -22,6 +23,7 @@ export function initActionSchema(db: Database.Database): void {
     state TEXT NOT NULL CHECK(state IN ('claimed','sending','confirmed','unknown')),
     token TEXT NOT NULL,
     lease_until INTEGER,
+    dispatched_at TEXT,
     sender_id TEXT NOT NULL,
     target_id TEXT NOT NULL,
     channel TEXT NOT NULL,
@@ -78,7 +80,7 @@ export function beginDispatch(db: Database.Database, key: string, token: string,
       return { started: false, reason: "claim lost or expired" };
     const reason = gate();
     if (reason) return { started: false, reason };
-    db.prepare(`UPDATE dispatch_actions SET state = 'sending', lease_until = NULL, updated_at = CURRENT_TIMESTAMP
+    db.prepare(`UPDATE dispatch_actions SET state = 'sending', lease_until = NULL, dispatched_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
       WHERE action_key = ? AND token = ? AND state = 'claimed'`).run(key, token);
     return { started: true };
   }).immediate();
