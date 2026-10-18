@@ -148,11 +148,17 @@ test("legacy global relationship snapshot migrates on two independent starts wit
   const directory = mkdtempSync(join(tmpdir(), "linki-legacy-integration-"));
   const legacyPath = join(directory, "legacy.db");
   try {
+    db.prepare("INSERT INTO workflows (id, name) VALUES (?, ?)").run("legacy-workflow", "Legacy fixture");
+    db.prepare(`INSERT INTO runs (id, workflow_id, account_id, status, started_at)
+      VALUES (?, ?, ?, 'running', ?)`).run("legacy-run", "legacy-workflow", "ben", "2025-12-01T12:00:00Z");
+    db.prepare("INSERT INTO run_profiles (id, run_id, target_id) VALUES (?, ?, ?)")
+      .run("legacy-profile", "legacy-run", "alex");
     await db.backup(legacyPath);
     const legacy = new Database(legacyPath);
     legacy.pragma("foreign_keys = OFF");
     for (const table of ["account_relationships", "account_target_state", "legacy_relationship_audit",
-      "connection_sync_state", "inbox_sync_state", "dispatch_actions", "suppression_rules", "email_outbound", "email_inbound"]) {
+      "connection_sync_state", "inbox_sync_state", "dispatch_actions", "suppression_rules", "email_outbound", "email_inbound",
+      "reliability_migrations", "legacy_outreach_review"]) {
       legacy.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     legacy.pragma("foreign_keys = ON");
@@ -164,7 +170,12 @@ test("legacy global relationship snapshot migrates on two independent starts wit
       if (db.pragma('foreign_key_check').length) throw Error('foreign key failure');
       if (count('legacy_relationship_audit') < 1) throw Error('legacy history lost');
       if (count('account_relationships') !== 0) throw Error('ambiguous relationship gained sender');
-      console.log(JSON.stringify({audit: count('legacy_relationship_audit'), relationships: count('account_relationships')}));`;
+      if (count('legacy_outreach_review') !== 1) throw Error('legacy run not held exactly once');
+      const run = db.prepare("SELECT status FROM runs WHERE id = 'legacy-run'").get();
+      if (run.status !== 'paused') throw Error('legacy run remained active');
+      const exclusion = db.prepare("SELECT COUNT(*) AS count FROM suppression_rules WHERE reason = 'legacy_outreach_review' AND kind = 'target' AND value = 'alex'").get().count;
+      if (exclusion !== 1) throw Error('legacy target not held exactly once');
+      console.log(JSON.stringify({audit: count('legacy_relationship_audit'), relationships: count('account_relationships'), reviews: count('legacy_outreach_review'), exclusion}));`;
     for (let start = 0; start < 2; start++) {
       const child = spawnSync(process.execPath, ["--import", "tsx", "--eval", program], {
         cwd: process.cwd(),
@@ -172,7 +183,7 @@ test("legacy global relationship snapshot migrates on two independent starts wit
         encoding: "utf8",
       });
       assert.equal(child.status, 0, child.stderr);
-      assert.deepEqual(JSON.parse(child.stdout.trim()), { audit: 1, relationships: 0 });
+      assert.deepEqual(JSON.parse(child.stdout.trim()), { audit: 1, relationships: 0, reviews: 1, exclusion: 1 });
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
