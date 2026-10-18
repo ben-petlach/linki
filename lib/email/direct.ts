@@ -4,6 +4,8 @@ import { initActionSchema, claimAction, beginDispatch, confirmAction, holdUnknow
 import { evaluateEligibility } from "@/lib/reliability/suppression";
 import { isEmailInboxFresh, registerOutboundEmail, markOutboundAccepted } from "@/lib/email/inbox";
 import { sendEmail, type EmailAccount } from "@/lib/email/sender";
+import { getProviderDispatchBlockReason } from "@/lib/reliability/provider-health";
+import { getDispatchBlockReason, initOperationsSchema } from "@/lib/reliability/operations";
 
 /** All prospect-facing direct email must pass the same durable and policy gates as runner sends. */
 export async function sendDirectEmail(db: Database.Database, input: {
@@ -34,7 +36,8 @@ export async function sendDirectEmail(db: Database.Database, input: {
       return { ok: false, status: 409, error: begun.reason ?? "Send blocked" };
     }
     started = true;
-    const result = await sendEmail(input.account, input.recipient, input.subject, input.body, { messageId, inReplyTo: input.inReplyTo, references: input.references });
+    const result = await sendEmail(input.account, input.recipient, input.subject, input.body, { messageId, inReplyTo: input.inReplyTo, references: input.references,
+      ...(!input.replyId ? { unsubscribeActionKey: key } : {}) });
     if (!result.accepted.some(value => value.toLowerCase() === input.recipient.toLowerCase())) {
       holdUnknown(db, key, token, "SMTP response did not acknowledge recipient");
       return { ok: false, status: 502, error: "SMTP did not acknowledge recipient; held for review" };
@@ -53,6 +56,11 @@ export async function sendDirectEmail(db: Database.Database, input: {
 }
 
 function gate(db: Database.Database, targetId: string, accountId: string, recipient: string, actionKey: string, registered: boolean, replyId?: string, inReplyTo?: string): string | null {
+  initOperationsSchema(db);
+  const globalBlock = getDispatchBlockReason(db);
+  if (globalBlock) return globalBlock;
+  const providerBlock = getProviderDispatchBlockReason(db, accountId, "email");
+  if (providerBlock) return providerBlock;
   const target = db.prepare("SELECT email, email_status FROM targets WHERE id = ?")
     .get(targetId) as { email: string | null; email_status: string | null } | undefined;
   if (!target || target.email?.trim().toLowerCase() !== recipient.trim().toLowerCase()) return "Recipient identity changed";

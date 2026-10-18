@@ -1,6 +1,7 @@
 import nodemailer from "nodemailer";
 import Imap from "imap";
 import { randomUUID } from "crypto";
+import { createUnsubscribeUrl } from "@/lib/reliability/provider-health";
 
 export interface EmailAccount {
   id: string;
@@ -19,7 +20,7 @@ export async function sendEmail(
   to: string,
   subject: string,
   body: string,
-  options?: { messageId?: string; inReplyTo?: string; references?: string[] }
+  options?: { messageId?: string; inReplyTo?: string; references?: string[]; unsubscribeActionKey?: string }
 ): Promise<{ messageId: string; accepted: string[]; rejected: string[] }> {
   const transporter = nodemailer.createTransport({
     host: account.smtp_host,
@@ -38,11 +39,18 @@ export async function sendEmail(
     : account.from_email;
 
   const messageId = options?.messageId ?? `<${randomUUID()}@${account.from_email.split("@")[1]}>`;
+  const unsubscribeUrl = options?.unsubscribeActionKey ? createUnsubscribeUrl(options.unsubscribeActionKey) : null;
+  const oneClickUrl = options?.unsubscribeActionKey ? createUnsubscribeUrl(options.unsubscribeActionKey, undefined, true) : null;
+  const text = unsubscribeUrl ? `${body}\n\nUnsubscribe: ${unsubscribeUrl}` : body;
   const result = await transporter.sendMail({
-    from, to, subject, text: body, messageId,
+    from, to, subject, text, messageId,
     ...(options?.inReplyTo ? { inReplyTo: options.inReplyTo } : {}),
     ...(options?.references ? { references: options.references } : {}),
     ...(account.reply_to ? { replyTo: account.reply_to } : {}),
+    ...(oneClickUrl ? { headers: {
+      "List-Unsubscribe": `<${oneClickUrl}>`,
+      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    } } : {}),
   });
   return { messageId: result.messageId, accepted: result.accepted.map(String), rejected: result.rejected.map(String) };
 }

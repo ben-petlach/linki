@@ -29,8 +29,6 @@ function contextOptions(storageState?: object) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     storageState: storageState as any,
     viewport: { width: 1920, height: 1080 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     locale: "en-US",
     timezoneId: "America/New_York",
     permissions: ["clipboard-read", "clipboard-write"] as ("clipboard-read" | "clipboard-write")[],
@@ -219,13 +217,7 @@ export async function authenticateAccount(accountId: string): Promise<void> {
   });
 
   try {
-    const ctx = await visibleBrowser.newContext({
-      viewport: { width: 1440, height: 900 },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      locale: "en-US",
-      timezoneId: "America/New_York",
-    });
+    const ctx = await visibleBrowser.newContext(contextOptions());
 
     const page = await ctx.newPage();
     await page.goto("https://www.linkedin.com/login");

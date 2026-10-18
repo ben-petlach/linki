@@ -6,6 +6,7 @@ import { getDb } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
 import { initInboxStateSchema, recordInboxSyncFailure, recordInboxSyncSuccess, getInboxFreshness } from "@/lib/reliability/inbox-state";
 import { suppressIdentity, suppressTarget } from "@/lib/reliability/suppression";
+import { recordSenderBounce } from "@/lib/reliability/provider-health";
 
 export const MAX_EMAIL_INBOX_AGE_MS = 5 * 60_000;
 const POLL_INTERVAL_MS = 2 * 60_000;
@@ -103,7 +104,7 @@ function headerIds(mail: ParsedMail): string[] {
 }
 
 /** Returns true only when a durable state change was made. */
-export async function processInboundEmail(db: Db, emailAccountId: string, raw: Buffer | string): Promise<"reply" | "unsubscribe" | "bounce" | "ambiguous" | "ignored" | "duplicate"> {
+export async function processInboundEmail(db: Db, emailAccountId: string, raw: Buffer | string, authenticatedImapScan = false): Promise<"reply" | "unsubscribe" | "bounce" | "ambiguous" | "ignored" | "duplicate"> {
   initEmailReliabilitySchema(db);
   const mail = await simpleParser(raw);
   const messageId = normalizedMessageId(mail.messageId) || `sha256:${createHash("sha256").update(raw).digest("hex")}`;
@@ -140,6 +141,7 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
         .run(emailAccountId, messageId, matched!.target_id, receivedAt);
       db.prepare("UPDATE targets SET email_status = 'invalid' WHERE id = ?").run(matched!.target_id);
       suppressIdentity(db, { kind: "email", value: finalRecipient, reason: "hard_bounce", evidence: messageId });
+      if (authenticatedImapScan) recordSenderBounce(db, { emailAccountId, recipient: finalRecipient, messageId, receivedAt });
       db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Email bounced — invalid address'
         WHERE run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?) AND track = 'email' AND state IN ('pending', 'in_progress')`)
         .run(matched!.target_id);
@@ -242,7 +244,7 @@ export async function syncEmailInbox(emailAccountId: string, db: Db = getDb()): 
     const uids = await withTimeout(search(imap, [["SINCE", since]]), "IMAP search");
     for (const uid of uids) {
       if (connectionError) throw connectionError;
-      const kind = await processInboundEmail(db, emailAccountId, await withTimeout(readMessage(imap, uid), "IMAP fetch"));
+      const kind = await processInboundEmail(db, emailAccountId, await withTimeout(readMessage(imap, uid), "IMAP fetch"), true);
       if (kind === "reply" || kind === "unsubscribe") replies++;
       if (kind === "bounce") bounces++;
     }
