@@ -3,7 +3,7 @@ import { randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
 import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
-import { sendMessage } from "@/lib/linkedin/message";
+import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { syncLinkedInInbox } from "@/lib/linkedin/inbox";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { sendEmail } from "@/lib/email/sender";
@@ -14,7 +14,7 @@ import { matchPerson } from "@/lib/apollo";
 import { premium } from "@/lib/premium";
 import { decryptSecret } from "@/lib/crypto";
 import { actionKey, beginDispatch, claimAction, confirmAction, getAction, holdUnknown, releaseClaim } from "@/lib/reliability/actions";
-import { isConnectedForAccount, recordConnectedEvidence, recordConnectionRequested, getConnectionRequestedAt, recordMessagingIdentity, getMessagingIdentity } from "@/lib/reliability/relationships";
+import { isConnectedForAccount, recordConnectedEvidence, recordConnectionRequested, getConnectionRequestedAt, recordMessagingIdentity, getMessagingIdentity, clearConnectedEvidence } from "@/lib/reliability/relationships";
 import { getInboxFreshness } from "@/lib/reliability/inbox-state";
 import { evaluateEligibility } from "@/lib/reliability/suppression";
 
@@ -926,6 +926,12 @@ async function executeStep(
     if (err instanceof PendingInviteError) {
       log(db, runId, target.id, "info", `${name} invite already pending — will recheck`);
       if (!getConnectionRequestedAt(db, accountId, target.id)) recordConnectionRequested(db, { accountId, targetId: target.id, requestedAt: nowIso() });
+      trWait(db, tr, CONNECTION_RECHECK_HOURS);
+      return;
+    }
+    if (err instanceof NotConnectedError) {
+      clearConnectedEvidence(db, accountId, target.id);
+      log(db, runId, target.id, "warn", `${name} is not connected to this sender — rechecking later`);
       trWait(db, tr, CONNECTION_RECHECK_HOURS);
       return;
     }
