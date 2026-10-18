@@ -26,6 +26,7 @@ export async function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
   if (!pathname.startsWith("/api/")) return NextResponse.next();
+  if (pathname === "/api/unsubscribe") return NextResponse.next();
   if (PUBLIC_API_PREFIXES.some(p => pathname.startsWith(p))) return NextResponse.next();
 
   const authed = await isAuthenticated(req);

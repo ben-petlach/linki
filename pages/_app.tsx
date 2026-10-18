@@ -6,7 +6,7 @@ import { useEffect } from "react";
 import Layout from "@/components/layout/Layout";
 import { Toaster } from "sonner";
 
-const PUBLIC_PATHS = ["/login"];
+const PUBLIC_PATHS = ["/login", "/unsubscribe"];
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const { data: session, status } = useSession();

@@ -10,6 +10,9 @@ import { initEmailReliabilitySchema } from "@/lib/email/inbox";
 import { initLinkedInInboxSchema } from "@/lib/linkedin/inbox";
 import { initRelationshipSchema, initLegacyOutreachReview } from "@/lib/reliability/relationships";
 import { initInboxStateSchema } from "@/lib/reliability/inbox-state";
+import { initOperationsSchema } from "@/lib/reliability/operations";
+import { initProviderHealthSchema } from "@/lib/reliability/provider-health";
+import { initSchedulerSchema } from "@/lib/reliability/scheduler";
 
 const DB_PATH = process.env.LINKI_DB_PATH || path.join(process.cwd(), "linki.db");
 
@@ -28,6 +31,9 @@ export function getDb(): Database.Database {
     initSuppressionSchema(db);
     initEmailReliabilitySchema(db);
     initLinkedInInboxSchema(db);
+    initOperationsSchema(db);
+    initProviderHealthSchema(db);
+    initSchedulerSchema(db);
     initLegacyOutreachReview(db);
     scheduleUpdateCheck();
   }

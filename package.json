@@ -7,7 +7,7 @@
     "dev": "next dev",
     "prebuild": "node scripts/mirror-ee.js",
     "build": "next build",
-    "start": "next start",
+    "start": "node --import tsx scripts/start-server.mjs",
     "lint": "node scripts/lint-baseline.cjs",
     "mirror:ee": "node scripts/mirror-ee.js",
     "test:reliability": "node --import ./tests/setup.mjs --import tsx --test tests/reliability/*.test.ts",
@@ -15,7 +15,10 @@
     "typecheck": "tsc --noEmit",
     "lint:all": "eslint",
     "audit:security": "npm audit --audit-level=high",
-    "test:dependencies": "node --test tests/dependency/*.test.mjs"
+    "test:dependencies": "node --test tests/dependency/*.test.mjs",
+    "test:operations": "node --import ./tests/setup.mjs --import tsx --test tests/operations/*.test.ts",
+    "db:backup": "node --import tsx scripts/backup-database.mjs",
+    "db:restore": "node --import tsx scripts/restore-database.mjs"
   },
   "dependencies": {
     "@types/bcryptjs": "^2.4.6",

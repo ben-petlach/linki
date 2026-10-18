@@ -7,6 +7,7 @@ const directory = mkdtempSync(join(tmpdir(), 'linki-test-'));
 process.env.LINKI_DB_PATH = join(directory, 'test.db');
 process.env.LINKI_DISABLE_BACKGROUND = '1';
 process.env.NEXTAUTH_SECRET = 'synthetic-test-secret-never-use-in-production';
+process.env.NEXTAUTH_URL = 'http://localhost:3000';
 process.env.NEXT_TELEMETRY_DISABLED = '1';
 process.on('exit', () => rmSync(directory, { recursive: true, force: true }));
 

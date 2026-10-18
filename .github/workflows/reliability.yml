@@ -31,9 +31,39 @@ jobs:
       - run: npm run lint
       - run: npm run test:reliability
       - run: npm run test:integration
+      - run: npm run test:operations
       - name: Repeat crash and concurrency acceptance
         run: |
           for attempt in 1 2 3; do
             node --import ./tests/setup.mjs --import tsx --test tests/reliability/dispatch.test.ts tests/reliability/suppression-routes.test.ts tests/integration/*.test.ts
           done
       - run: npm run build
+
+  container-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build checked-out fork (no push)
+        run: docker build --build-arg LINKI_SOURCE_COMMIT="$GITHUB_SHA" --build-arg APP_VERSION="$GITHUB_SHA" -t linki-ci:"$GITHUB_SHA" .
+      - name: Verify running revision and bundled browser
+        run: |
+          test "$(docker image inspect linki-ci:"$GITHUB_SHA" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          image_id=$(docker image inspect linki-ci:"$GITHUB_SHA" --format '{{.Id}}')
+          docker run --rm -e LINKI_EXPECTED_COMMIT="$GITHUB_SHA" -e LINKI_EXPECTED_IMAGE_DIGEST="$image_id" -e LINKI_IMAGE_DIGEST="$image_id" linki-ci:"$GITHUB_SHA" node scripts/container-smoke.mjs
+      - name: Scan OS and browser image separately from npm audit
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: linki-ci:${{ github.sha }}
+          format: table
+          output: container-vulnerabilities.txt
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          scanners: vuln
+          vuln-type: os,library
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-security-${{ github.sha }}
+          path: container-vulnerabilities.txt
+          if-no-files-found: ignore

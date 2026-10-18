@@ -3,7 +3,7 @@ import { useRouter } from "next/router";
 import Sidebar from "./Sidebar";
 import TourGate from "@/components/onboarding/TourGate";
 
-const NO_LAYOUT_PATHS = ["/login"];
+const NO_LAYOUT_PATHS = ["/login", "/unsubscribe"];
 
 export default function Layout({ children }: { children: ReactNode }) {
   const router = useRouter();
