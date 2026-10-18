@@ -77,6 +77,7 @@ async function checkForUpdate() {
 const g = global as typeof global & { __updateCheckScheduled?: boolean };
 
 export function scheduleUpdateCheck() {
+  if (process.env.LINKI_DISABLE_BACKGROUND === "1") return;
   if (g.__updateCheckScheduled) return;
   g.__updateCheckScheduled = true;
 

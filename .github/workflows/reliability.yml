@@ -1,0 +1,37 @@
+name: Core reliability
+
+on:
+  pull_request:
+  push:
+    branches: [reliability/core]
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LINKI_DISABLE_BACKGROUND: '1'
+      NEXT_TELEMETRY_DISABLED: '1'
+      NEXTAUTH_SECRET: synthetic-ci-secret-never-use-in-production
+      LINKI_DB_PATH: /tmp/linki-ci.db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run test:reliability
+      - run: npm run test:integration
+      - name: Repeat crash and concurrency acceptance
+        run: |
+          for attempt in 1 2 3; do
+            node --import ./tests/setup.mjs --import tsx --test tests/reliability/dispatch.test.ts tests/reliability/suppression-routes.test.ts tests/integration/core-reliability.test.ts
+          done
+      - run: npm run build

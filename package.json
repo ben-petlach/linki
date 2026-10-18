@@ -8,8 +8,12 @@
     "prebuild": "node scripts/mirror-ee.js",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint",
-    "mirror:ee": "node scripts/mirror-ee.js"
+    "lint": "node scripts/lint-baseline.cjs",
+    "mirror:ee": "node scripts/mirror-ee.js",
+    "test:reliability": "node --import ./tests/setup.mjs --import tsx --test tests/reliability/*.test.ts",
+    "test:integration": "node --import ./tests/setup.mjs --import tsx --test tests/integration/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint:all": "eslint"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -48,9 +52,15 @@
     "@types/papaparse": "^5.5.2",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/smtp-server": "^3.5.13",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
+    "smtp-server": "^3.19.23",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=22.13.0 <23"
   }
 }
