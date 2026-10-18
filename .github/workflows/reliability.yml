@@ -35,7 +35,7 @@ jobs:
       - name: Repeat crash and concurrency acceptance
         run: |
           for attempt in 1 2 3; do
-            node --import ./tests/setup.mjs --import tsx --test tests/reliability/dispatch.test.ts tests/reliability/suppression-routes.test.ts tests/integration/*.test.ts
+            node --import ./tests/setup.mjs --import tsx --test tests/reliability/dispatch.test.ts tests/reliability/suppression-routes.test.ts tests/integration/*.test.ts tests/operations/*.test.ts
           done
       - run: npm run build
 
@@ -51,6 +51,8 @@ jobs:
           test "$(docker image inspect linki-ci:"$GITHUB_SHA" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
           image_id=$(docker image inspect linki-ci:"$GITHUB_SHA" --format '{{.Id}}')
           docker run --rm -e LINKI_EXPECTED_COMMIT="$GITHUB_SHA" -e LINKI_EXPECTED_IMAGE_DIGEST="$image_id" -e LINKI_IMAGE_DIGEST="$image_id" linki-ci:"$GITHUB_SHA" node scripts/container-smoke.mjs
+      - name: Record installed OS package dependencies
+        run: docker run --rm linki-ci:"$GITHUB_SHA" dpkg-query -W -f '${binary:Package}\t${Depends}\n' > container-packages.txt
       - name: Scan OS and browser image separately from npm audit
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
@@ -65,5 +67,7 @@ jobs:
         if: always()
         with:
           name: container-security-${{ github.sha }}
-          path: container-vulnerabilities.json
+          path: |
+            container-vulnerabilities.json
+            container-packages.txt
           if-no-files-found: ignore
