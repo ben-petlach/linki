@@ -5,7 +5,10 @@ const path = require('node:path');
 
 async function main() {
   const baseline = JSON.parse(fs.readFileSync('tests/lint-baseline.json', 'utf8'));
-  const key = (entry) => JSON.stringify(entry);
+  // React compiler diagnostics embed absolute paths and code frames. These vary
+  // between checkout locations; rule, source line and diagnostic prose do not.
+  const normalizeMessage = (message) => message.split(/\n(?:\/|[A-Za-z]:\\)[^\n]+:\d+:\d+\n/)[0].trim();
+  const key = (entry) => JSON.stringify({ ...entry, message: normalizeMessage(entry.message) });
   const remaining = new Map();
   for (const entry of baseline) remaining.set(key(entry), (remaining.get(key(entry)) || 0) + 1);
   const results = await new ESLint().lintFiles(['.']);
