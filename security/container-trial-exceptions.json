@@ -1,0 +1,462 @@
+{
+  "scope": "Isolated headless controlled trial only; no public deployment; smoke restrictions required",
+  "expires": "2026-11-01T00:00:00Z",
+  "exceptions": [
+    {
+      "id": "CVE-2026-76642",
+      "package": "bsdutils",
+      "version": "1:2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "bsdutils",
+      "version": "1:2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "bsdutils",
+      "version": "1:2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "bsdutils",
+      "version": "1:2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2026-54369",
+      "package": "libacl1",
+      "version": "2.3.2-2+b1",
+      "severity": "HIGH",
+      "reason": "Privileged ACL pathname operations required; app has no ACL helper path and trial cannot gain privilege.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-54369"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "libblkid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "libblkid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "libblkid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "libblkid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2026-34980",
+      "package": "libcups2t64",
+      "version": "2.4.10-3+deb13u2",
+      "severity": "HIGH",
+      "reason": "Vulnerable cupsd scheduler and IPP backend absent, checked by image smoke. No printing service or queue.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-34980"
+    },
+    {
+      "id": "CVE-2026-55453",
+      "package": "libcups2t64",
+      "version": "2.4.10-3+deb13u2",
+      "severity": "HIGH",
+      "reason": "Vulnerable cupsd scheduler and IPP backend absent, checked by image smoke. No printing service or queue.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-55453"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "liblastlog2-2",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "liblastlog2-2",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "liblastlog2-2",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "liblastlog2-2",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "libmount1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "libmount1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "libmount1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "libmount1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "libsmartcols1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "libsmartcols1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "libsmartcols1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "libsmartcols1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2026-16742",
+      "package": "libsystemd0",
+      "version": "257.13-1~deb13u1",
+      "severity": "HIGH",
+      "reason": "systemd-homed executable/package absent, checked by image smoke; source package matching library only.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-16742"
+    },
+    {
+      "id": "CVE-2025-69720",
+      "package": "libtinfo6",
+      "version": "6.5+20250216-2",
+      "severity": "HIGH",
+      "reason": "Vulnerable infocmp CLI removed; package metadata preserved and absence checked by image smoke.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2025-69720"
+    },
+    {
+      "id": "CVE-2026-16742",
+      "package": "libudev1",
+      "version": "257.13-1~deb13u1",
+      "severity": "HIGH",
+      "reason": "systemd-homed executable/package absent, checked by image smoke; source package matching library only.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-16742"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "libuuid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "libuuid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "libuuid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "libuuid1",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2026-88806",
+      "package": "libx11-6",
+      "version": "2:1.8.12-1",
+      "severity": "HIGH",
+      "reason": "Attack requires malicious X server. Trial is headless without DISPLAY or host X sockets; no X server installed.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-88806"
+    },
+    {
+      "id": "CVE-2026-88806",
+      "package": "libx11-data",
+      "version": "2:1.8.12-1",
+      "severity": "HIGH",
+      "reason": "Attack requires malicious X server. Trial is headless without DISPLAY or host X sockets; no X server installed.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-88806"
+    },
+    {
+      "id": "CVE-2026-88806",
+      "package": "libx11-xcb1",
+      "version": "2:1.8.12-1",
+      "severity": "HIGH",
+      "reason": "Attack requires malicious X server. Trial is headless without DISPLAY or host X sockets; no X server installed.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-88806"
+    },
+    {
+      "id": "CVE-2026-6653",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "CRITICAL",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-6653"
+    },
+    {
+      "id": "CVE-2026-74860",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "HIGH",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-74860"
+    },
+    {
+      "id": "CVE-2026-86138",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "HIGH",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-86138"
+    },
+    {
+      "id": "CVE-2026-86139",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "HIGH",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-86139"
+    },
+    {
+      "id": "CVE-2026-86140",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "HIGH",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-86140"
+    },
+    {
+      "id": "CVE-2026-86142",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "HIGH",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-86142"
+    },
+    {
+      "id": "CVE-2026-86143",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "HIGH",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-86143"
+    },
+    {
+      "id": "CVE-2026-86144",
+      "package": "libxml2",
+      "version": "2.12.7+dfsg+really2.9.14-2.1+deb13u3",
+      "severity": "HIGH",
+      "reason": "Temporary residual-risk acceptance ONLY for isolated trial with test-only credentials. OS parser arrives via Mesa/LLVM; inspected LLVM XML use is Windows manifest merging, not an application input route. No XML tools/Python bindings or LLVM tools installed. Complete native reachability is NOT proven. Non-root, no capabilities, no-new-privileges, 2 GiB/256-process limits and disposable host contain impact. See docs/container-security-assessment.md; not public deployment clearance.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-86144"
+    },
+    {
+      "id": "CVE-2026-88807",
+      "package": "libxrender1",
+      "version": "1:0.9.12-1",
+      "severity": "HIGH",
+      "reason": "Attack requires malicious X server. Trial is headless without DISPLAY or host X sockets; no X server installed.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-88807"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "login",
+      "version": "1:4.16.0-2+really2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "login",
+      "version": "1:4.16.0-2+really2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "login",
+      "version": "1:4.16.0-2+really2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "login",
+      "version": "1:4.16.0-2+really2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "mount",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "mount",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "mount",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "mount",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    },
+    {
+      "id": "CVE-2025-69720",
+      "package": "ncurses-base",
+      "version": "6.5+20250216-2",
+      "severity": "HIGH",
+      "reason": "Vulnerable infocmp CLI removed; package metadata preserved and absence checked by image smoke.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2025-69720"
+    },
+    {
+      "id": "CVE-2025-69720",
+      "package": "ncurses-bin",
+      "version": "6.5+20250216-2",
+      "severity": "HIGH",
+      "reason": "Vulnerable infocmp CLI removed; package metadata preserved and absence checked by image smoke.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2025-69720"
+    },
+    {
+      "id": "CVE-2026-9538",
+      "package": "perl-base",
+      "version": "5.40.1-6+deb13u1",
+      "severity": "HIGH",
+      "reason": "Archive::Tar module absent, checked by image smoke. No Perl archive ingestion in application.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-9538"
+    },
+    {
+      "id": "CVE-2026-76642",
+      "package": "util-linux",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-76642"
+    },
+    {
+      "id": "CVE-2026-78408",
+      "package": "util-linux",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78408"
+    },
+    {
+      "id": "CVE-2026-78409",
+      "package": "util-linux",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78409"
+    },
+    {
+      "id": "CVE-2026-78410",
+      "package": "util-linux",
+      "version": "2.41.5-0+deb13u1",
+      "severity": "HIGH",
+      "reason": "Privileged mount hooks or root nsenter are prerequisites. Trial runs non-root with zero capabilities and no-new-privileges; no host namespaces, fstab mounts or privileged exec.",
+      "source": "https://security-tracker.debian.org/tracker/CVE-2026-78410"
+    }
+  ]
+}

@@ -41,6 +41,20 @@ Before any real upgrade, check that schema changes are backward compatible or su
 
 CI must perform a clean `docker build` from the commit, launch bundled Chromium as the `node` user in that image, run a local fixture, verify the version endpoint against commit and image ID, and scan the built image's OS packages with Trivy (separate from `npm audit`). No registry push or deployment belongs in that gate.
 
-The October 18, 2026 Debian 13 container scan still blocks release: **1 critical and 56 high OS findings** on the tested image, with no fixed Debian 13 version reported for those findings. Application Node packages and bundled npm findings were zero after removing npm from runtime. The critical `libxml2` package remains in the browser dependency chain (`libgbm1` to `mesa-libgallium` to `libllvm19` to `libxml2`); removing it would need a separately validated browser image change. Debian's [libxml2 advisory](https://security-tracker.debian.org/tracker/CVE-2026-6653) tracks the upstream fix status. Xvfb was removed, but required X11, CUPS, GLib, and base OS packages retain high findings. CI keeps the high/critical gate failing until patched packages or a reviewed replacement runtime is available. A green build and browser smoke test alone do not clear this gate.
+The October 18, 2026 baseline scan reported **1 critical and 56 high OS findings**
+(20 unique CVEs). See [focused container assessment](container-security-assessment.md)
+for attack prerequisites, source evidence and the bounded trial decision. The trial
+gate retains the raw report and checks exact CVE/package/version/severity exceptions
+through November 1, 2026 UTC. Unknown findings, available fixes or expired exceptions
+fail. This is not a zero-vulnerability or unrestricted release claim. The libxml2
+findings are explicit residual risk, not proof that all native paths are unreachable.
+
+Trial Compose now drops all capabilities, forbids privilege gain and caps memory
+at 2 GiB/processes at 256. CI executes the browser/app smoke with these same options
+and asserts the restrictions plus absent vulnerable service/tool entry points.
+Run only on a disposable isolated host/VM with test-only credentials, no public
+port, host filesystem/socket/display mounts or privileged exec. These restrictions
+must not be relaxed to get a test running. Visible login and public deployment are
+outside this assessment. No live-provider trial was performed.
 
 Playwright is pinned to `1.64.1`, which selects Chromium `156.0.8078.4` (revision `1248`). The browser smoke verifies the binary and app page in the final image. Trivy covers installed OS packages and discoverable libraries; this report does not establish complete CVE coverage of the downloaded Chromium binary or prove live LinkedIn compatibility.

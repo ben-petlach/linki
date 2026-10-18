@@ -50,7 +50,7 @@ jobs:
         run: |
           test "$(docker image inspect linki-ci:"$GITHUB_SHA" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
           image_id=$(docker image inspect linki-ci:"$GITHUB_SHA" --format '{{.Id}}')
-          docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true -e LINKI_EXPECTED_COMMIT="$GITHUB_SHA" -e LINKI_EXPECTED_IMAGE_DIGEST="$image_id" -e LINKI_IMAGE_DIGEST="$image_id" linki-ci:"$GITHUB_SHA" node scripts/container-smoke.mjs
+          docker run --rm --cap-drop=ALL --security-opt=no-new-privileges:true --memory=2g --pids-limit=256 -e LINKI_EXPECTED_COMMIT="$GITHUB_SHA" -e LINKI_EXPECTED_IMAGE_DIGEST="$image_id" -e LINKI_IMAGE_DIGEST="$image_id" linki-ci:"$GITHUB_SHA" node scripts/container-smoke.mjs
       - name: Record installed OS package dependencies
         run: docker run --rm linki-ci:"$GITHUB_SHA" dpkg-query -W -f '${binary:Package}\t${Depends}\n' > container-packages.txt
       - name: Scan OS and browser image separately from npm audit
@@ -60,9 +60,11 @@ jobs:
           format: json
           output: container-vulnerabilities.json
           severity: HIGH,CRITICAL
-          exit-code: '1'
+          exit-code: '0'
           scanners: vuln
           vuln-type: os,library
+      - name: Enforce assessed trial findings (raw scan retained)
+        run: node scripts/check-container-findings.mjs container-vulnerabilities.json security/container-trial-exceptions.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

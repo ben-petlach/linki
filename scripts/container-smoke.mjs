@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawn, execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -9,6 +9,23 @@ import { chromium } from "playwright";
 
 const require = createRequire(import.meta.url);
 assert.equal(typeof require("fast-glob").globSync, "function", "local fast-glob package missing from image");
+
+// These are the runtime prerequisites for the bounded container CVE assessment.
+assert.notEqual(process.getuid(), 0, "runtime must be non-root");
+const processStatus = readFileSync("/proc/self/status", "utf8");
+assert.match(processStatus, /^NoNewPrivs:\s+1$/m);
+assert.match(processStatus, /^CapEff:\s+0+$/m);
+assert.match(processStatus, /^CapBnd:\s+0+$/m);
+assert.equal(readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim(), "2147483648");
+assert.equal(readFileSync("/sys/fs/cgroup/pids.max", "utf8").trim(), "256");
+assert.ok(!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY, "headless trial must not connect to display servers");
+for (const file of ["/usr/bin/infocmp", "/usr/sbin/cupsd", "/usr/lib/cups/backend/ipp", "/lib/systemd/systemd-homed", "/usr/lib/systemd/systemd-homed"]) {
+  assert.equal(existsSync(file), false, `unexpected vulnerable entry point: ${file}`);
+}
+const packages = execFileSync("dpkg-query", ["-W", "-f", "${binary:Package} ${db:Status-Status}\\n"], { encoding: "utf8" });
+assert.doesNotMatch(packages, /^(libxml2-utils|python3-libxml2|llvm-19|llvm-19-tools|cups-daemon|cups-ipp-utils|systemd-homed|xserver-xorg-core|xvfb)(?::\S+)? installed$/m);
+const perlModule = execFileSync("perl", ["-e", 'print eval { require Archive::Tar; 1 } ? "present" : "absent"'], { encoding: "utf8" });
+assert.equal(perlModule, "absent", "Archive::Tar must not be shipped in the trial image");
 
 const expectedCommit = process.env.LINKI_EXPECTED_COMMIT;
 const expectedDigest = process.env.LINKI_EXPECTED_IMAGE_DIGEST;

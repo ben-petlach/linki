@@ -67,3 +67,11 @@ Independent suite, first pass on 2026-10-18 (Node 22.23.1):
 Provider failure mapping: authentication expiry and throttling use `tests/operations/linkedin-fencing.test.ts`; local IMAP disconnect, SMTP TLS certificate rejection, temporary and hard DSNs, and delayed SMTP acknowledgement use `tests/reliability/email.test.ts`; LinkedIn pagination, normalized response, and malformed continuation use `tests/reliability/linkedin-inbox.test.ts`; wrong-recipient and missing provider acknowledgement use `tests/reliability/linkedin-send.test.ts` and `linkedin-connect.test.ts`. The latest full suite must pass on the PR revision.
 
 Application acceptance is implemented and independently tested. Clean Ubuntu acceptance, source-image build, authenticated revision check, and bundled-browser login smoke passed at `059f7ac` ([CI evidence](https://github.com/ben-petlach/linki/actions/runs/39151138265)). Container release acceptance remains BLOCKED: that image scan reported 57 high/critical OS findings across 20 unique CVEs (1 critical, 56 high), all without fixed Debian 13 versions in the report. No ignore rules or severity bypass were added. The application npm audit and scanned Node libraries are clean. See the release runbook for the remaining libxml2 dependency chain. The final PR revision reruns every gate, including the additional upgrade/rollback test and updated Playwright browser; consult its check results for exact-head status. DNS record presence is diagnostic only, not domain alignment or deliverability proof. Complaint ingestion is an authenticated adapter hook; no provider complaint integration is claimed.
+
+## Focused trial security follow-up
+
+The previous blanket container blocker is superseded **only for an isolated trial**
+by [the focused assessment](container-security-assessment.md). Exact, expiring
+exceptions retain raw findings. XML/parser and unsandboxed-browser residual risk
+are explicit. Unrestricted release, public exposure and live provider verification
+remain unapproved/unverified. CI checks containment and exception behavior.
