@@ -320,18 +320,35 @@ export async function dispatchStep<T>(
       if (reply?.last_replied_at || reply?.email_replied_at) return "lead replied";
       const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin", checkNetNewRules: true });
       if (!suppression.allowed) return `suppressed: ${suppression.blocks.map(b => b.reason).join(", ")}`;
-      // Any channel configured for this profile can still receive a reply,
-      // including a completed track. Check every relevant sender before sending.
-      const tracks = db.prepare("SELECT DISTINCT track FROM run_profile_tracks WHERE run_profile_id = ?")
-        .all(tr.run_profile_id) as Array<{ track: "linkedin" | "email" }>;
-      for (const relevant of tracks) {
-        const relevantSender = relevant.track === "linkedin" ? assignment.account_id : assignment.email_account_id;
-        if (!relevantSender) continue;
+      // Replies can arrive on another run's sender, including completed tracks.
+      // Include outbound action history to cover direct sends and sender rotation.
+      const replyInboxes = db.prepare(`
+        SELECT DISTINCT rt.track AS channel,
+          CASE rt.track WHEN 'linkedin' THEN r.account_id ELSE rp.email_account_id END AS sender_id
+        FROM run_profile_tracks rt
+        JOIN run_profiles rp ON rp.id = rt.run_profile_id
+        JOIN runs r ON r.id = rp.run_id
+        WHERE rp.target_id = ? AND (
+          rt.state IN ('pending','in_progress')
+          OR EXISTS (SELECT 1 FROM logs l WHERE l.run_id = rp.run_id AND l.target_id = rp.target_id
+            AND ((rt.track = 'email' AND l.message LIKE 'Email sent%')
+              OR (rt.track = 'linkedin' AND (
+                l.message LIKE 'Connection request sent%' OR l.message LIKE 'Message sent%' OR l.message LIKE 'InMail sent%'))))
+        )
+        UNION
+        SELECT DISTINCT CASE WHEN da.channel = 'email' THEN 'email' ELSE 'linkedin' END AS channel,
+          da.sender_id AS sender_id
+        FROM dispatch_actions da
+        WHERE da.target_id = ? AND da.channel IN ('email','linkedin','connect','message','sales_inmail')
+          AND da.state IN ('sending','confirmed','unknown')
+      `).all(target.id, target.id) as Array<{ channel: "linkedin" | "email"; sender_id: string | null }>;
+      for (const relevant of replyInboxes) {
+        if (!relevant.sender_id) continue;
         const inbox = getInboxFreshness(db, {
-          accountId: relevantSender, channel: relevant.track,
-          maxAgeMs: relevant.track === "email" ? MAX_EMAIL_INBOX_AGE_MS : 30 * 60_000,
+          accountId: relevant.sender_id, channel: relevant.channel,
+          maxAgeMs: relevant.channel === "email" ? MAX_EMAIL_INBOX_AGE_MS : 30 * 60_000,
         });
-        if (!inbox.fresh) return `${relevant.track} inbox ${inbox.reason}`;
+        if (!inbox.fresh) return `${relevant.channel} inbox ${inbox.reason}`;
       }
       if (channel === "message" && !isConnectedForAccount(db, senderId, target.id)) return "sender has no verified connection";
       const used = (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
