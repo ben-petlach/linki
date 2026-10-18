@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { ESLint } from 'eslint'
 import nextPlugin from '@next/eslint-plugin-next'
 import adapter from '../../vendor/fast-glob/index.cjs'
@@ -49,8 +51,8 @@ async function lintLink(root, rootDir, href) {
 
 test('directory glob adapter preserves Next root selection', () => {
   assert.equal(
-    pluginRequire('fast-glob/package.json').description,
-    'Scoped directory glob adapter for @next/eslint-plugin-next',
+    pluginRequire('fast-glob/package.json').name,
+    '@linki/next-directory-glob',
   )
   const root = fixture()
   try {
@@ -67,6 +69,26 @@ test('directory glob adapter preserves Next root selection', () => {
       path.join(two, 'pages'),
     ].sort())
     assert.throws(() => adapter.globSync('apps/*', { onlyFiles: true }), /Unsupported fast-glob call/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('relative literal and recursive roots keep fast-glob directory paths', () => {
+  const root = fixture()
+  try {
+    const adapterPath = fileURLToPath(new URL('../../vendor/fast-glob/index.cjs', import.meta.url))
+    const script = `const glob = require(${JSON.stringify(adapterPath)}).globSync; console.log(JSON.stringify({ literal: glob('./apps/one', { onlyDirectories: true }), recursive: glob('./apps/**', { onlyDirectories: true }) }))`
+    const result = JSON.parse(execFileSync(process.execPath, ['-e', script], { cwd: root, encoding: 'utf8' }))
+    assert.deepEqual(result.literal, ['./apps/one'])
+    assert.deepEqual(result.recursive.sort(), [
+      './apps/one',
+      './apps/one/nested',
+      './apps/one/nested/pages',
+      './apps/one/pages',
+      './apps/two',
+      './apps/two/pages',
+    ].sort())
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

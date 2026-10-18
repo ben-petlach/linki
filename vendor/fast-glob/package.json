@@ -1,6 +1,6 @@
 {
-  "name": "fast-glob",
-  "version": "3.3.1",
+  "name": "@linki/next-directory-glob",
+  "version": "1.0.0",
   "private": true,
   "description": "Scoped directory glob adapter for @next/eslint-plugin-next",
   "main": "index.cjs",
