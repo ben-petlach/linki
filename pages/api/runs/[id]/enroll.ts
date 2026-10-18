@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
+import { evaluateEligibility } from "@/lib/reliability/suppression";
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
@@ -63,15 +64,20 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
 
   let skipped_already_enrolled = 0;
   let skipped_active_elsewhere = 0;
+  let skipped_suppressed = 0;
+  let enrolled = 0;
+  const suppression_blocks: Array<{ target_id: string; blocks: ReturnType<typeof evaluateEligibility>["blocks"] }> = [];
   const eligible: string[] = [];
-  for (const tid of target_ids) {
+  for (const tid of new Set(target_ids)) {
     if (alreadyEnrolled.has(tid)) { skipped_already_enrolled++; continue; }
     if (activeElsewhere.has(tid)) { skipped_active_elsewhere++; continue; }
+    const verdict = evaluateEligibility(db, tid, { netNew: true });
+    if (!verdict.allowed) { skipped_suppressed++; suppression_blocks.push({ target_id: tid, blocks: verdict.blocks }); continue; }
     eligible.push(tid);
   }
 
   if (eligible.length === 0) {
-    return res.json({ enrolled: 0, skipped_already_enrolled, skipped_active_elsewhere });
+    return res.json({ enrolled: 0, skipped_already_enrolled, skipped_active_elsewhere, skipped_suppressed, suppression_blocks });
   }
 
   // Assign email accounts: company-grouped round-robin (same as run creation)
@@ -105,6 +111,13 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   );
   const insertMany = db.transaction((ids: string[]) => {
     for (const tid of ids) {
+      const verdict = evaluateEligibility(db, tid, { netNew: true });
+      if (!verdict.allowed) { skipped_suppressed++; suppression_blocks.push({ target_id: tid, blocks: verdict.blocks }); continue; }
+      const duplicate = db.prepare(`SELECT 1 FROM run_profiles rp JOIN runs r ON r.id = rp.run_id
+        WHERE rp.target_id = ? AND (r.workflow_id = ? OR (r.status IN ('running', 'paused')
+        AND EXISTS (SELECT 1 FROM run_profile_tracks rt WHERE rt.run_profile_id = rp.id
+        AND rt.state NOT IN ('completed', 'failed', 'skipped')))) LIMIT 1`).get(tid, run.workflow_id);
+      if (duplicate) { skipped_already_enrolled++; continue; }
       const assignedEmailAccountId = emailAssignment.get(tid) ?? null;
       const rpId = randomUUID();
       insertProfile.run(rpId, runId, tid, assignedEmailAccountId);
@@ -112,13 +125,16 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
         if (track === "email" && !assignedEmailAccountId) continue;
         insertTrack.run(randomUUID(), rpId, track);
       }
+      enrolled++;
     }
   });
-  insertMany(eligible);
+  insertMany.immediate(eligible);
 
   return res.json({
-    enrolled: eligible.length,
+    enrolled,
     skipped_already_enrolled,
     skipped_active_elsewhere,
+    skipped_suppressed,
+    suppression_blocks,
   });
 }

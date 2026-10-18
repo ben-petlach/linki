@@ -1,6 +1,7 @@
 import Papa from "papaparse";
 import type DatabaseType from "better-sqlite3";
 import { randomUUID } from "crypto";
+import { normalizeSuppressionValue } from "./reliability/suppression";
 
 type DB = DatabaseType.Database;
 
@@ -53,12 +54,11 @@ export interface CsvImportResult {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function normalizeLinkedinUrl(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (!trimmed || !trimmed.includes("linkedin.com/in/")) return null;
-  return trimmed;
+  return normalizeSuppressionValue("linkedin", raw);
 }
 
 interface ParsedRow {
+  rowNum: number;
   linkedin_url: string | null;
   sales_nav_url: string | null;
   email: string | null;
@@ -108,7 +108,7 @@ export function importCsv(db: DB, listId: string, csvText: string): CsvImportRes
       return;
     }
 
-    rows.push({ linkedin_url, sales_nav_url, email, full_name, fields });
+    rows.push({ rowNum, linkedin_url, sales_nav_url, email, full_name, fields });
   });
 
   const editableCols = [...EDITABLE_FIELDS, "full_name", "sales_nav_url"] as const;
@@ -121,7 +121,7 @@ export function importCsv(db: DB, listId: string, csvText: string): CsvImportRes
       ${editableCols.map((c) => `${c} = COALESCE(excluded.${c}, targets.${c})`).join(",\n      ")}
   `);
   const findByLinkedin = db.prepare("SELECT id FROM targets WHERE linkedin_url = ?");
-  const findByEmail = db.prepare("SELECT id FROM targets WHERE email = ? LIMIT 1");
+  const findByEmail = db.prepare("SELECT id FROM targets WHERE LOWER(email) = ? LIMIT 1");
   const insertByEmail = db.prepare(`
     INSERT INTO targets (id, email, full_name, ${EDITABLE_FIELDS.join(", ")}, sales_nav_url)
     VALUES (?, ?, ?, ${EDITABLE_FIELDS.map(() => "?").join(", ")}, ?)
@@ -138,14 +138,26 @@ export function importCsv(db: DB, listId: string, csvText: string): CsvImportRes
       let targetId: string;
       let isNew: boolean;
       const fieldValues = EDITABLE_FIELDS.map((f) => row.fields[f]);
+      const byLinkedin = row.linkedin_url ? findByLinkedin.get(row.linkedin_url) as { id: string } | undefined : undefined;
+      const byEmail = row.email ? findByEmail.get(row.email) as { id: string } | undefined : undefined;
+      if (byLinkedin && byEmail && byLinkedin.id !== byEmail.id) {
+        errors.push(`Row ${row.rowNum}: email and LinkedIn profile belong to different contacts`);
+        skipped++;
+        continue;
+      }
+      if (row.linkedin_url && !byLinkedin && byEmail) {
+        errors.push(`Row ${row.rowNum}: email already belongs to another contact; LinkedIn identity unverified`);
+        skipped++;
+        continue;
+      }
 
       if (row.linkedin_url) {
-        const existing = findByLinkedin.get(row.linkedin_url) as { id: string } | undefined;
+        const existing = byLinkedin;
         isNew = !existing;
         targetId = existing?.id ?? randomUUID();
         insertByLinkedin.run(targetId, row.linkedin_url, row.email, row.sales_nav_url, row.full_name, ...fieldValues);
       } else {
-        const existing = findByEmail.get(row.email) as { id: string } | undefined;
+        const existing = byEmail;
         isNew = !existing;
         if (existing) {
           targetId = existing.id;

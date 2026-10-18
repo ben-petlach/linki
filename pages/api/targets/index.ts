@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import type { ActiveFilter, FilterOp } from "@/components/ui/FilterBar";
+import { preserveTargetSuppressionOnDelete } from "@/lib/reliability/suppression";
 
 // Parse f[0][field], f[0][op], f[0][value], f[1][field], ... from query
 function parseFilters(query: NextApiRequest["query"]): ActiveFilter[] {
@@ -149,6 +150,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     // run_profiles/logs have no ON DELETE CASCADE — clear them first so the FK
     // constraint doesn't block the delete. run_profile_tracks cascade off run_profiles.
     const result = db.transaction(() => {
+      for (const id of target_ids) preserveTargetSuppressionOnDelete(db, id);
       db.prepare(`DELETE FROM run_profiles WHERE target_id IN (${placeholders})`).run(...target_ids);
       db.prepare(`DELETE FROM logs WHERE target_id IN (${placeholders})`).run(...target_ids);
       return db.prepare(`DELETE FROM targets WHERE id IN (${placeholders})`).run(...target_ids);

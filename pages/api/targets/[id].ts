@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
+import { preserveTargetSuppressionOnDelete } from "@/lib/reliability/suppression";
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   const db = getDb();
@@ -53,6 +54,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     // Some references (run_profiles, logs) have no ON DELETE CASCADE — clear them first so the
     // FK constraint doesn't block the delete. run_profile_tracks cascade off run_profiles.
     db.transaction(() => {
+      preserveTargetSuppressionOnDelete(db, id);
       db.prepare("DELETE FROM run_profiles WHERE target_id = ?").run(id);
       db.prepare("DELETE FROM logs WHERE target_id = ?").run(id);
       db.prepare("DELETE FROM targets WHERE id = ?").run(id);

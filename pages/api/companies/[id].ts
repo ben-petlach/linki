@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
+import { preserveCompanySuppressionOnDelete } from "@/lib/reliability/suppression";
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   const db = getDb();
@@ -36,8 +37,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
 
   if (req.method === "DELETE") {
     // Unlink contacts first, then delete company
-    db.prepare("UPDATE targets SET company_id = NULL WHERE company_id = ?").run(id);
-    db.prepare("DELETE FROM companies WHERE id = ?").run(id);
+    db.transaction(() => {
+      preserveCompanySuppressionOnDelete(db, id);
+      db.prepare("UPDATE targets SET company_id = NULL WHERE company_id = ?").run(id);
+      db.prepare("DELETE FROM companies WHERE id = ?").run(id);
+    })();
     return res.json({ ok: true });
   }
 
