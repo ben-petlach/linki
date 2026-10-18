@@ -63,7 +63,7 @@ async function fetchThread(cfg: ImapConfig, contactEmail: string): Promise<Email
       host: cfg.host,
       port: cfg.port,
       tls: true,
-      tlsOptions: { rejectUnauthorized: false },
+      tlsOptions: { rejectUnauthorized: true },
       user: cfg.user,
       password: cfg.password,
       authTimeout: 10_000,

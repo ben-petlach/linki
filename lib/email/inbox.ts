@@ -1,47 +1,16 @@
 import Imap from "imap";
-import { simpleParser } from "mailparser";
+import { simpleParser, type ParsedMail } from "mailparser";
 import { randomUUID } from "crypto";
+import type Database from "better-sqlite3";
 import { getDb } from "@/lib/db";
-import { premium } from "@/lib/premium";
 import { decryptSecret } from "@/lib/crypto";
+import { initInboxStateSchema, recordInboxSyncFailure, recordInboxSyncSuccess, getInboxFreshness } from "@/lib/reliability/inbox-state";
+import { suppressIdentity, suppressTarget } from "@/lib/reliability/suppression";
 
-const IMAP_POLL_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
-// Jul 2026 incident: all email accounts became "due" in the same tick and synced
-// back-to-back (one 20-account burst ran 3 minutes straight, one account alone took
-// 85s), which lined up with NocoDB/n8n healthcheck failures on the shared host. A
-// deterministic per-account offset spreads accounts across a window so they drift
-// apart over successive cycles instead of staying clustered together forever.
-const IMAP_POLL_JITTER_MS = 30 * 60 * 1000; // 30 min
+const MAX_INBOX_AGE_MS = 3 * 60 * 60 * 1000;
+const POLL_INTERVAL_MS = 2 * 60 * 60 * 1000;
 
-function accountJitterMs(accountId: string): number {
-  let h = 0;
-  for (let i = 0; i < accountId.length; i++) h = (h * 31 + accountId.charCodeAt(i)) >>> 0;
-  return h % IMAP_POLL_JITTER_MS;
-}
-
-const BOUNCE_SENDER_PATTERNS = [
-  /mailer-daemon@/i,
-  /postmaster@/i,
-  /mail-delivery-subsystem@/i,
-  /delivery-status@/i,
-  /amazonses\.com$/i,
-];
-
-function extractEmails(text: string): string[] {
-  return [...text.matchAll(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g)].map(m => m[0].toLowerCase());
-}
-
-function isBounce(fromEmail: string): boolean {
-  return BOUNCE_SENDER_PATTERNS.some(p => p.test(fromEmail));
-}
-
-function parseHeaderValue(raw: string, field: string): string {
-  const regex = new RegExp(`^${field}:[ \\t]*(.+?)(?=\\r?\\n[^\\s]|$)`, "im");
-  const m = raw.match(regex);
-  if (!m) return "";
-  return m[1].replace(/\r?\n[\t ]+/g, " ").trim();
-}
-
+type Db = Database.Database;
 interface EmailAccount {
   id: string;
   imap_host: string | null;
@@ -50,318 +19,219 @@ interface EmailAccount {
   password: string;
   imap_username: string | null;
   imap_password: string | null;
-  inbox_synced_at: string | null;
 }
 
-/**
- * Fetches the body + headers for a given UID and inserts a row into
- * `email_replies` (idempotent — skips if a row with the same target_id +
- * received_at already exists). Best-effort: errors are swallowed by the caller.
- */
-export function captureReplyBody(
-  imap: Imap,
-  db: ReturnType<typeof getDb>,
-  targetId: string,
-  fromEmail: string,
-  uid: number,
-): Promise<string | null> {
-  return new Promise<string | null>((resolve) => {
-    // Fetch the full raw RFC822 message — mailparser handles MIME multipart,
-    // base64 / quoted-printable transfer encodings, and charset decoding. The
-    // old HEADER+TEXT regex approach stored raw base64 / =XX escapes for the
-    // common German auto-reply formats, feeding the classifier garbage.
-    const fetch = imap.fetch(uid, { bodies: [""], struct: false });
+export function initEmailReliabilitySchema(db: Db): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS email_outbound (
+      action_key TEXT PRIMARY KEY,
+      target_id TEXT NOT NULL,
+      email_account_id TEXT NOT NULL,
+      recipient_email TEXT NOT NULL,
+      message_id TEXT NOT NULL UNIQUE,
+      subject TEXT NOT NULL,
+      payload_hash TEXT,
+      accepted_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_outbound_recipient ON email_outbound(recipient_email, accepted_at);
+    CREATE TABLE IF NOT EXISTS email_inbound (
+      email_account_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      target_id TEXT,
+      kind TEXT NOT NULL,
+      received_at TEXT NOT NULL,
+      PRIMARY KEY (email_account_id, message_id)
+    );
+  `);
+}
 
-    const chunks: Buffer[] = [];
+export function registerOutboundEmail(db: Db, input: {
+  actionKey: string; targetId: string; emailAccountId: string;
+  recipient: string; messageId: string; subject: string; payloadHash?: string; createdAt?: string;
+}): void {
+  db.prepare(`INSERT OR IGNORE INTO email_outbound
+    (action_key, target_id, email_account_id, recipient_email, message_id, subject, payload_hash, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(input.actionKey, input.targetId, input.emailAccountId,
+      input.recipient.trim().toLowerCase(), input.messageId.trim().toLowerCase(), input.subject, input.payloadHash ?? null, input.createdAt ?? new Date().toISOString());
+  const row = db.prepare("SELECT target_id, email_account_id, recipient_email, message_id, subject, payload_hash FROM email_outbound WHERE action_key = ?")
+    .get(input.actionKey) as { target_id: string; email_account_id: string; recipient_email: string; message_id: string; subject: string; payload_hash: string | null };
+  if (row.target_id !== input.targetId || row.email_account_id !== input.emailAccountId ||
+      row.recipient_email !== input.recipient.trim().toLowerCase() || row.message_id !== input.messageId.trim().toLowerCase() ||
+      row.subject !== input.subject || row.payload_hash !== (input.payloadHash ?? null)) {
+    throw new Error("Outbound action key reused with different recipient or message");
+  }
+}
 
-    fetch.on("message", (msg) => {
-      msg.on("body", (stream) => {
-        stream.on("data", (c: Buffer) => chunks.push(c));
-      });
-    });
+export function markOutboundAccepted(db: Db, actionKey: string, acceptedAt = new Date().toISOString()): void {
+  const result = db.prepare("UPDATE email_outbound SET accepted_at = COALESCE(accepted_at, ?) WHERE action_key = ?")
+    .run(acceptedAt, actionKey);
+  if (!result.changes) throw new Error("Outbound email record missing");
+}
 
-    fetch.once("error", () => resolve(null));
-    fetch.once("end", () => {
-      void (async () => {
-        try {
-          const raw = Buffer.concat(chunks);
-          const parsed = await simpleParser(raw);
+function normalizedMessageId(value: string | null | undefined): string {
+  return (value ?? "").trim().toLowerCase();
+}
 
-          const subject = parsed.subject ?? null;
-          const parsedFrom =
-            parsed.from?.value?.[0]?.address?.toLowerCase().trim() || fromEmail.toLowerCase();
-          const receivedAt = parsed.date ? parsed.date.toISOString() : new Date().toISOString();
+function address(mail: ParsedMail): string {
+  return mail.from?.value?.[0]?.address?.trim().toLowerCase() ?? "";
+}
 
-          // Prefer decoded plain text; fall back to stripping the HTML part.
-          const rawText =
-            parsed.text ??
-            (parsed.html ? parsed.html.replace(/<[^>]+>/g, " ") : "");
-          const bodyText = rawText
-            .replace(/\r\n/g, "\n")
-            .replace(/\n{3,}/g, "\n\n")
-            .replace(/[ \t]{2,}/g, " ")
-            .trim()
-            .slice(0, 16_000);
+function textBody(mail: ParsedMail): string {
+  return (mail.text ?? (typeof mail.html === "string" ? mail.html.replace(/<[^>]+>/g, " ") : ""))
+    .replace(/\r\n/g, "\n").trim().slice(0, 16_000);
+}
 
-          if (!bodyText) { resolve(null); return; }
+function headerIds(mail: ParsedMail): string[] {
+  const refs = typeof mail.references === "string" ? [mail.references] : (mail.references ?? []);
+  return [...refs, mail.inReplyTo ?? ""].flatMap(x => x.match(/<[^<>]+>/g) ?? [])
+    .map(normalizedMessageId);
+}
 
-          // Dedup: skip if we already have a row for this target with the same received_at
-          const existing = db.prepare(
-            "SELECT id FROM email_replies WHERE target_id = ? AND received_at = ?"
-          ).get(targetId, receivedAt) as { id: string } | undefined;
+/** Returns true only when a durable state change was made. */
+export async function processInboundEmail(db: Db, emailAccountId: string, raw: Buffer | string): Promise<"reply" | "unsubscribe" | "bounce" | "ignored" | "duplicate"> {
+  initEmailReliabilitySchema(db);
+  const mail = await simpleParser(raw);
+  const messageId = normalizedMessageId(mail.messageId);
+  if (!messageId) return "ignored"; // Cannot deduplicate a message without stable identity.
+  const duplicate = db.prepare("SELECT 1 FROM email_inbound WHERE email_account_id = ? AND message_id = ?")
+    .get(emailAccountId, messageId);
+  if (duplicate) return "duplicate";
+  const receivedAt = (mail.date ?? new Date()).toISOString();
+  const from = address(mail);
+  const body = textBody(mail);
+  const ids = headerIds(mail);
+  let matched: { target_id: string; recipient_email: string; accepted_at: string | null; created_at: string } | undefined;
+  for (const id of ids) {
+    matched = db.prepare(`SELECT target_id, recipient_email, accepted_at, created_at FROM email_outbound
+      WHERE email_account_id = ? AND message_id = ?`).get(emailAccountId, id) as typeof matched;
+    if (matched) break;
+  }
+  const isDsn = /mailer-daemon|postmaster|mail-delivery-subsystem|delivery-status/i.test(from);
+  const finalRecipient = isDsn ? body.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i)?.[1]?.toLowerCase() : undefined;
+  const unsubscribed = /\b(unsubscribe|remove me|stop emailing|do not email|don't email|opt out)\b/i.test(body);
+  // Unthreaded opt-outs and DSNs use exact address plus accepted outbound chronology.
+  // Ordinary replies require RFC threading IDs; old unrelated email cannot pause a campaign.
+  if (!matched && (finalRecipient || (unsubscribed && from))) {
+    matched = db.prepare(`SELECT target_id, recipient_email, accepted_at, created_at FROM email_outbound
+      WHERE email_account_id = ? AND recipient_email = ? AND accepted_at IS NOT NULL AND accepted_at <= ?
+      ORDER BY accepted_at DESC LIMIT 1`).get(emailAccountId, finalRecipient ?? from, receivedAt) as typeof matched;
+  }
+  if (!matched || Date.parse(receivedAt) < Date.parse(matched.accepted_at ?? matched.created_at)) return "ignored";
+  if (isDsn) {
+    if (!finalRecipient || finalRecipient !== matched.recipient_email ||
+        !/Action:\s*failed\b/i.test(body) || !/Status:\s*5\.\d(?:\.\d+)?\b/i.test(body)) return "ignored";
+    db.transaction(() => {
+      db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, 'bounce', ?)")
+        .run(emailAccountId, messageId, matched!.target_id, receivedAt);
+      db.prepare("UPDATE targets SET email_status = 'invalid' WHERE id = ?").run(matched!.target_id);
+      suppressIdentity(db, { kind: "email", value: finalRecipient, reason: "hard_bounce", evidence: messageId });
+      db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Email bounced — invalid address'
+        WHERE run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?) AND track = 'email' AND state IN ('pending', 'in_progress')`)
+        .run(matched!.target_id);
+    })();
+    return "bounce";
+  }
+  if (from !== matched.recipient_email) return "ignored";
+  const kind = unsubscribed ? "unsubscribe" : "reply";
+  db.transaction(() => {
+    db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, ?, ?)")
+      .run(emailAccountId, messageId, matched!.target_id, kind, receivedAt);
+    db.prepare(`INSERT INTO email_replies (id, target_id, run_id, from_email, subject, body_text, received_at)
+      VALUES (?, ?, (SELECT rp.run_id FROM run_profiles rp WHERE rp.target_id = ? AND rp.email_account_id = ? ORDER BY rp.created_at DESC LIMIT 1), ?, ?, ?, ?)`)
+      .run(randomUUID(), matched!.target_id, matched!.target_id, emailAccountId, from, mail.subject ?? null, body, receivedAt);
+    db.prepare("UPDATE targets SET email_replied_at = COALESCE(email_replied_at, ?) WHERE id = ?")
+      .run(receivedAt, matched!.target_id);
+    suppressTarget(db, matched!.target_id, "inbound_reply", messageId);
+    if (unsubscribed) {
+      suppressTarget(db, matched!.target_id, "unsubscribe", messageId);
+      suppressIdentity(db, { kind: "email", value: from, reason: "unsubscribe", evidence: messageId });
+    }
+    db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Lead replied'
+      WHERE run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?) AND state IN ('pending', 'in_progress')`)
+      .run(matched!.target_id);
+  })();
+  return kind;
+}
 
-          if (existing) { resolve(null); return; }
-
-          // Look up the most recent active run for this target — the dispatcher needs
-          // it to find the email track to reschedule / enroll a substitute into.
-          const runRow = db.prepare(
-            `SELECT r.id FROM runs r
-             JOIN run_profiles rp ON rp.run_id = r.id
-             WHERE rp.target_id = ? AND r.status IN ('running', 'paused')
-             ORDER BY r.created_at DESC LIMIT 1`
-          ).get(targetId) as { id: string } | undefined;
-
-          const replyId = randomUUID();
-          db.prepare(
-            `INSERT INTO email_replies (id, target_id, run_id, from_email, subject, body_text, received_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`
-          ).run(replyId, targetId, runRow?.id ?? null, parsedFrom, subject, bodyText, receivedAt);
-          resolve(replyId);
-        } catch (err) {
-          console.warn(`[email-inbox] captureReplyBody parse/insert failed:`, err);
-          resolve(null);
-        }
-      })();
-    });
-  });
+export function isEmailInboxFresh(db: Db, emailAccountId: string): { fresh: boolean; reason: string | null } {
+  initInboxStateSchema(db);
+  return getInboxFreshness(db, { accountId: emailAccountId, channel: "email", maxAgeMs: MAX_INBOX_AGE_MS });
 }
 
 export function shouldSyncEmailInbox(emailAccountId: string): boolean {
   const db = getDb();
-  const account = db
-    .prepare("SELECT inbox_synced_at FROM email_accounts WHERE id = ?")
-    .get(emailAccountId) as { inbox_synced_at: string | null } | undefined;
-  if (!account?.inbox_synced_at) return true;
-  const dueAfterMs = IMAP_POLL_INTERVAL_MS + accountJitterMs(emailAccountId);
-  return Date.now() - new Date(account.inbox_synced_at).getTime() >= dueAfterMs;
+  const row = db.prepare("SELECT inbox_synced_at FROM email_accounts WHERE id = ?").get(emailAccountId) as { inbox_synced_at: string | null } | undefined;
+  if (!row?.inbox_synced_at || !isEmailInboxFresh(db, emailAccountId).fresh) return true;
+  return Date.now() - Date.parse(row.inbox_synced_at + (row.inbox_synced_at.includes("T") ? "" : "Z")) >= POLL_INTERVAL_MS;
 }
 
-/**
- * Opens one IMAP connection, then for each lead that has been emailed but
- * not yet replied, runs a server-side FROM search. Only touches the mailbox
- * index — never downloads message bodies for reply detection.
- *
- * Also scans the last 50 messages for bounces (mailer-daemon etc.).
- */
-export async function syncEmailInbox(emailAccountId: string): Promise<{ replies: number; bounces: number }> {
-  const db = getDb();
+function readMessage(imap: Imap, uid: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const fetch = imap.fetch(uid, { bodies: "", struct: false });
+    fetch.on("message", msg => msg.on("body", stream => stream.on("data", (chunk: Buffer) => chunks.push(chunk))));
+    fetch.once("error", reject);
+    fetch.once("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
 
-  const account = db
-    .prepare("SELECT id, imap_host, imap_port, username, password, imap_username, imap_password, inbox_synced_at FROM email_accounts WHERE id = ?")
-    .get(emailAccountId) as EmailAccount | undefined;
+function search(imap: Imap, criteria: unknown[]): Promise<number[]> {
+  return new Promise((resolve, reject) => imap.search(criteria as Parameters<Imap["search"]>[0], (err, uids) => err ? reject(err) : resolve(uids)));
+}
 
+function withTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    operation,
+    new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), 30_000); }),
+  ]).finally(() => clearTimeout(timer!));
+}
+
+export async function syncEmailInbox(emailAccountId: string, db: Db = getDb()): Promise<{ replies: number; bounces: number }> {
+  const startedAt = new Date().toISOString();
+  initEmailReliabilitySchema(db);
+  initInboxStateSchema(db);
+  const account = db.prepare(`SELECT id, imap_host, imap_port, username, password, imap_username, imap_password
+    FROM email_accounts WHERE id = ?`).get(emailAccountId) as EmailAccount | undefined;
   if (!account?.imap_host) {
-    console.warn(`[email-inbox] Account ${emailAccountId} has no IMAP config — skipping`);
-    return { replies: 0, bounces: 0 };
+    recordInboxSyncFailure(db, { accountId: emailAccountId, channel: "email", error: "IMAP not configured", startedAt });
+    throw new Error("IMAP not configured");
   }
-
-  // Leads that were emailed via this account and haven't replied yet
-  const pendingTargets = db.prepare(`
-    SELECT DISTINCT t.id, t.email
-    FROM targets t
-    JOIN run_profiles rp ON rp.target_id = t.id
-    JOIN run_profile_tracks rt ON rt.run_profile_id = rp.id
-    WHERE t.email IS NOT NULL
-      AND t.email_replied_at IS NULL
-      AND t.email_status != 'invalid'
-      AND rt.track = 'email'
-      AND rt.state NOT IN ('pending')
-      AND rp.email_account_id = ?
-  `).all(emailAccountId) as { id: string; email: string }[];
-
-  if (pendingTargets.length === 0) {
-    db.prepare("UPDATE email_accounts SET inbox_synced_at = datetime('now') WHERE id = ?").run(emailAccountId);
-    return { replies: 0, bounces: 0 };
-  }
-
-  console.log(`[email-inbox] Checking ${pendingTargets.length} leads via IMAP FROM search`);
-
-  const imapUser = account.imap_username ?? account.username;
-  const imapPass = decryptSecret(account.imap_password) ?? decryptSecret(account.password)!;
-
+  const earliest = db.prepare(`SELECT MIN(COALESCE(accepted_at, created_at)) AS at FROM email_outbound WHERE email_account_id = ?`)
+    .get(emailAccountId) as { at: string | null };
+  const since = earliest.at ? new Date(earliest.at) : new Date();
+  since.setUTCDate(since.getUTCDate() - 1); // IMAP SINCE compares calendar dates.
+  const imap = new Imap({ host: account.imap_host, port: account.imap_port ?? 993, tls: true,
+    tlsOptions: { rejectUnauthorized: true }, user: account.imap_username ?? account.username,
+    password: decryptSecret(account.imap_password) ?? decryptSecret(account.password)!,
+    authTimeout: 10_000, connTimeout: 12_000 });
   let replies = 0;
   let bounces = 0;
-
-  await new Promise<void>((resolve) => {
-    const imap = new Imap({
-      host: account.imap_host!,
-      port: account.imap_port ?? 993,
-      tls: true,
-      tlsOptions: { rejectUnauthorized: false },
-      user: imapUser,
-      password: imapPass,
-      authTimeout: 10_000,
-      connTimeout: 12_000,
-    });
-
-    const done = () => {
-      try { imap.end(); } catch { /* ignore */ }
-      resolve();
-    };
-
-    imap.once("error", (err: Error) => {
-      console.warn(`[email-inbox] IMAP error for account ${emailAccountId}:`, err.message);
-      done();
-    });
-
-    imap.once("ready", () => {
-      imap.openBox("INBOX", true, async (err, box) => {
-        if (err || !box) { console.warn("[email-inbox] openBox failed:", err?.message); done(); return; }
-
-        // ── Reply detection: one FROM search per lead ──────────────────────────
-        // Run sequentially — the imap library serialises commands over one TCP connection
-        for (const target of pendingTargets) {
-          await new Promise<void>((resSearch) => {
-            imap.search([["FROM", target.email]], async (searchErr, uids) => {
-              if (searchErr) { resSearch(); return; }
-              if (uids.length > 0) {
-                console.log(`[email-inbox] Reply detected for ${target.email} (target ${target.id})`);
-                replies++;
-
-                // Capture the body, then let the classifier+dispatcher decide the action.
-                // We no longer eagerly stamp email_replied_at here — the dispatcher does it
-                // for skip-buckets (call_task / human_reply / not_interested) but leaves it
-                // unset for OOO follow-ups so the runner keeps the contact enrolled.
-                // On any failure the contact stays enrolled (safe fallback, plan §3.2).
-                try {
-                  const latestUid = uids[uids.length - 1];
-                  const replyId = await captureReplyBody(imap, db, target.id, target.email, latestUid);
-                  // The reply is always STORED (open-core). AI classification + auto-followup
-                  // is a premium feature — skipped cleanly when ee/ is absent.
-                  if (replyId && premium?.replies) {
-                    await premium.replies.classifyAndDispatch(replyId);
-                  }
-                } catch (err) {
-                  console.warn(`[email-inbox] Failed to capture/dispatch reply for ${target.email}:`, err);
-                }
-              }
-              resSearch();
-            });
-          });
-        }
-
-        // ── Bounce detection: scan last 50 messages for mailer-daemon ─────────
-        if (box.messages.total > 0) {
-          const total = box.messages.total;
-          const start = Math.max(1, total - 49);
-          const range = `${start}:${total}`;
-
-          await new Promise<void>((resFetch) => {
-            const fetch = imap.seq.fetch(range, {
-              bodies: ["HEADER.FIELDS (FROM TO)", "TEXT"],
-              struct: false,
-            });
-
-            type RawMsg = { header: string; body: string };
-            const msgs: RawMsg[] = [];
-
-            fetch.on("message", (msg) => {
-              const entry: RawMsg = { header: "", body: "" };
-              msg.on("body", (stream, info) => {
-                const chunks: Buffer[] = [];
-                stream.on("data", (c: Buffer) => chunks.push(c));
-                stream.once("end", () => {
-                  const text = Buffer.concat(chunks).toString();
-                  if (info.which.startsWith("HEADER")) entry.header = text;
-                  else entry.body = text.slice(0, 3000);
-                });
-              });
-              msg.once("end", () => msgs.push(entry));
-            });
-
-            fetch.once("error", () => resFetch());
-            fetch.once("end", () => {
-              for (const msg of msgs) {
-                const fromRaw = parseHeaderValue(msg.header, "From");
-                const toRaw = parseHeaderValue(msg.header, "To");
-
-                const emailMatch = fromRaw.match(/<([^>]+)>/) ?? fromRaw.match(/([^\s]+@[^\s]+)/);
-                const fromEmail = emailMatch?.[1]?.toLowerCase().trim();
-                if (!fromEmail || !isBounce(fromEmail)) continue;
-
-                // Also extract Final-Recipient from DSN bodies (SES bounce format)
-                const finalRecipient = msg.body.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i)?.[1] ?? "";
-                const candidates = extractEmails(msg.body + " " + toRaw + " " + finalRecipient);
-                for (const candidate of candidates) {
-                  if (BOUNCE_SENDER_PATTERNS.some(p => p.test(candidate))) continue;
-
-                  const target = db
-                    .prepare("SELECT id, email_status, company_id FROM targets WHERE lower(email) = ?")
-                    .get(candidate) as { id: string; email_status: string | null; company_id: string | null } | undefined;
-
-                  if (!target || target.email_status === "invalid") continue;
-
-                  const note = `Email bounced on ${new Date().toISOString().slice(0, 10)} — marked invalid`;
-                  db.prepare(`
-                    UPDATE targets SET email_status = 'invalid',
-                      notes = CASE WHEN notes IS NULL OR notes = '' THEN ? ELSE notes || char(10) || ? END
-                    WHERE id = ?
-                  `).run(note, note, target.id);
-
-                  db.prepare(`
-                    UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Email bounced — invalid address'
-                    WHERE run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?)
-                    AND state IN ('pending', 'in_progress')
-                  `).run(target.id);
-
-                  if (target.company_id) {
-                    const companyNote = `Email domain flagged invalid — bounce for ${candidate} on ${new Date().toISOString().slice(0, 10)}`;
-                    db.prepare(`
-                      UPDATE companies SET email_domain_invalid = 1,
-                        notes = CASE WHEN notes IS NULL OR notes = '' THEN ? ELSE notes || char(10) || ? END
-                      WHERE id = ?
-                    `).run(companyNote, companyNote, target.company_id);
-
-                    const siblings = db.prepare(`
-                      SELECT id FROM targets WHERE company_id = ? AND id != ? AND email IS NOT NULL AND email_status != 'invalid'
-                    `).all(target.company_id, target.id) as { id: string }[];
-
-                    for (const sibling of siblings) {
-                      const sibNote = `Email bounced on ${new Date().toISOString().slice(0, 10)} — marked invalid (domain flagged via company)`;
-                      db.prepare(`
-                        UPDATE targets SET email_status = 'invalid',
-                          notes = CASE WHEN notes IS NULL OR notes = '' THEN ? ELSE notes || char(10) || ? END
-                        WHERE id = ?
-                      `).run(sibNote, sibNote, sibling.id);
-                      db.prepare(`
-                        UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Email domain invalid — company flagged'
-                        WHERE run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?)
-                        AND state IN ('pending', 'in_progress')
-                      `).run(sibling.id);
-                    }
-
-                    if (siblings.length > 0) {
-                      console.log(`[email-inbox] Company ${target.company_id} flagged — ${siblings.length} sibling(s) marked invalid`);
-                    }
-                  }
-
-                  console.log(`[email-inbox] Bounce for ${candidate} (target ${target.id}) — marked invalid`);
-                  bounces++;
-                  break;
-                }
-              }
-              resFetch();
-            });
-          });
-        }
-
-        done();
-      });
-    });
-
-    imap.connect();
-  });
-
-  db.prepare("UPDATE email_accounts SET inbox_synced_at = datetime('now') WHERE id = ?").run(emailAccountId);
-  return { replies, bounces };
+  let connectionError: Error | null = null;
+  imap.on("error", err => { connectionError = err; });
+  try {
+    await withTimeout(new Promise<void>((resolve, reject) => {
+      imap.once("ready", () => resolve());
+      imap.once("error", reject);
+      imap.connect();
+    }), "IMAP connection");
+    await withTimeout(new Promise<void>((resolve, reject) => imap.openBox("INBOX", true, err => err ? reject(err) : resolve())), "IMAP openBox");
+    const uids = await withTimeout(search(imap, [["SINCE", since]]), "IMAP search");
+    for (const uid of uids) {
+      if (connectionError) throw connectionError;
+      const kind = await processInboundEmail(db, emailAccountId, await withTimeout(readMessage(imap, uid), "IMAP fetch"));
+      if (kind === "reply" || kind === "unsubscribe") replies++;
+      if (kind === "bounce") bounces++;
+    }
+    if (connectionError) throw connectionError;
+    recordInboxSyncSuccess(db, { accountId: emailAccountId, channel: "email", startedAt });
+    db.prepare("UPDATE email_accounts SET inbox_synced_at = datetime('now') WHERE id = ?").run(emailAccountId);
+    return { replies, bounces };
+  } catch (err) {
+    recordInboxSyncFailure(db, { accountId: emailAccountId, channel: "email", error: err instanceof Error ? err.message : String(err), startedAt });
+    throw err;
+  } finally {
+    try { imap.end(); } catch { /* connection may have failed before setup */ }
+  }
 }

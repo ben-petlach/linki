@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
-import { sendEmail } from "@/lib/email/sender";
+import { sendDirectEmail } from "@/lib/email/direct";
 import { decryptSecret } from "@/lib/crypto";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -9,15 +9,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).end();
   }
 
-  const { emailAccountId, to, subject, body } = req.body as {
+  const { emailAccountId, to, subject, body, targetId, idempotencyKey } = req.body as {
     emailAccountId?: string;
     to?: string;
     subject?: string;
     body?: string;
+    targetId?: string;
+    idempotencyKey?: string;
   };
 
-  if (!emailAccountId || !to || !subject || !body) {
-    return res.status(400).json({ error: "emailAccountId, to, subject, and body are required" });
+  if (!emailAccountId || !to || !subject || !body || !targetId) {
+    return res.status(400).json({ error: "emailAccountId, to, subject, body, and targetId are required" });
   }
 
   const db = getDb();
@@ -30,11 +32,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   if (!account) return res.status(404).json({ error: "Email account not found" });
 
-  try {
-    await sendEmail({ ...account, password: decryptSecret(account.password)! }, to, subject, body);
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("[inbox/reply] send failed:", err);
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Send failed" });
-  }
+  const result = await sendDirectEmail(db, {
+    targetId, account: { ...account, password: decryptSecret(account.password)! },
+    recipient: to, subject, body,
+    idempotencyKey: idempotencyKey ?? req.headers["idempotency-key"]?.toString() ?? "",
+  });
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  return res.json({ ok: true, messageId: result.messageId });
 }

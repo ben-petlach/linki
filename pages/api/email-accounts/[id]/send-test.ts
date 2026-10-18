@@ -25,6 +25,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   if (!account) return res.status(404).json({ error: "not found" });
 
+  if (to.trim().toLowerCase() !== account.from_email.trim().toLowerCase()) {
+    return res.status(400).json({ error: "Test email recipient must be the sending account address" });
+  }
+
   const fullBody = buildEmailBody(body ?? "", account.signature);
 
   try {
