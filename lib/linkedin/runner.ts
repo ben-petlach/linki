@@ -3,14 +3,20 @@ import { randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
 import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
-import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
+import { sendMessage } from "@/lib/linkedin/message";
+import { syncLinkedInInbox } from "@/lib/linkedin/inbox";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { sendEmail } from "@/lib/email/sender";
 import { shouldSyncEmailInbox, syncEmailInbox } from "@/lib/email/inbox";
+import { registerOutboundEmail, markOutboundAccepted } from "@/lib/email/inbox";
 import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
 import { premium } from "@/lib/premium";
 import { decryptSecret } from "@/lib/crypto";
+import { actionKey, beginDispatch, claimAction, confirmAction, getAction, holdUnknown, releaseClaim } from "@/lib/reliability/actions";
+import { isConnectedForAccount, recordConnectedEvidence, recordConnectionRequested, getConnectionRequestedAt, recordMessagingIdentity, getMessagingIdentity } from "@/lib/reliability/relationships";
+import { getInboxFreshness } from "@/lib/reliability/inbox-state";
+import { evaluateEligibility } from "@/lib/reliability/suppression";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
 const SALES_NAV_ENRICH_MIN_GAP_MS = 5 * 60 * 1000;
@@ -252,6 +258,83 @@ function trRecordContext(db: ReturnType<typeof getDb>, tr: TrackRun, ctx: { link
   if (ctx.emailSubject !== undefined || ctx.emailBody !== undefined) {
     db.prepare("UPDATE run_profile_tracks SET last_email_subject = ?, last_email_body = ? WHERE id = ?")
       .run(ctx.emailSubject ?? null, ctx.emailBody ?? null, tr.id);
+  }
+}
+
+type SendChannel = "connect" | "message" | "sales_inmail" | "email";
+
+// Every external send crosses this boundary. The action becomes irrevocable before
+// the provider call: a crash or timeout after that point holds the step for review.
+async function dispatchStep<T>(
+  db: ReturnType<typeof getDb>, tr: TrackRun, step: WorkflowStep, target: Target,
+  senderId: string, channel: SendChannel, limit: number, schedule: ScheduleConfig,
+  payload: string,
+  send: () => Promise<T>, evidence: (result: T) => string
+): Promise<"sent" | "confirmed" | "held" | "deferred"> {
+  const key = actionKey(tr.id, step.id);
+  const claim = claimAction(db, { key, senderId, targetId: target.id, channel, payload });
+  if (!claim.claimed) {
+    if (claim.state === "confirmed") return "confirmed";
+    if (claim.state === "claimed") return "deferred";
+    trFail(db, tr, `Action ${key} held for review: ${claim.reason}`);
+    return "held";
+  }
+  const token = claim.token;
+  const started = beginDispatch(db, key, token, () => {
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(tr.run_id) as { status: string } | undefined;
+    if (run?.status !== "running") return "run paused";
+    if (!isWithinSchedule(schedule)) return "outside sender schedule";
+    if (channel === "email") {
+      const sender = db.prepare("SELECT is_verified FROM email_accounts WHERE id = ?").get(senderId) as { is_verified: number } | undefined;
+      if (!sender?.is_verified) return "email sender not verified";
+    } else {
+      const sender = db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(senderId) as { is_authenticated: number } | undefined;
+      if (!sender?.is_authenticated) return "LinkedIn sender not authenticated";
+    }
+    const track = db.prepare("SELECT state, current_step FROM run_profile_tracks WHERE id = ?").get(tr.id) as { state: string; current_step: number } | undefined;
+    if (track?.state !== "in_progress" || track.current_step !== tr.current_step) return "step changed";
+    const reply = db.prepare("SELECT last_replied_at, email_replied_at FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null } | undefined;
+    if (reply?.last_replied_at || reply?.email_replied_at) return "lead replied";
+    const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin" });
+    if (!suppression.allowed) return `suppressed: ${suppression.blocks.map(b => b.reason).join(", ")}`;
+    const inbox = getInboxFreshness(db, {
+      accountId: senderId, channel: channel === "email" ? "email" : "linkedin",
+      maxAgeMs: channel === "email" ? 3 * 60 * 60_000 : 30 * 60_000,
+    });
+    if (!inbox.fresh) return `inbox ${inbox.reason}`;
+    if (channel === "message" && !isConnectedForAccount(db, senderId, target.id)) return "sender has no verified connection";
+    const used = (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
+      WHERE sender_id = ? AND channel = ? AND state IN ('sending','confirmed','unknown')
+      AND date(created_at) = date('now')`).get(senderId, channel) as { count: number }).count;
+    const legacyMessage = channel === "connect" ? "Connection request sent%" :
+      channel === "message" ? "Message sent%" : channel === "sales_inmail" ? "InMail sent%" : "Email sent%";
+    const legacy = channel === "email"
+      ? (db.prepare(`SELECT COUNT(*) AS count FROM logs l WHERE l.message LIKE ? AND date(l.created_at) = date('now')
+          AND EXISTS (SELECT 1 FROM run_profiles rp WHERE rp.run_id = l.run_id AND rp.target_id = l.target_id AND rp.email_account_id = ?)`)
+          .get(legacyMessage, senderId) as { count: number }).count
+      : (db.prepare(`SELECT COUNT(*) AS count FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
+          AND message LIKE ? AND date(created_at) = date('now')`).get(senderId, legacyMessage) as { count: number }).count;
+    // Legacy logs and action rows can overlap. Double counting is conservative;
+    // it may defer a send, but cannot push an account past its cap.
+    const count = used + legacy;
+    if (count >= limit) return "daily limit reached";
+    return null;
+  });
+  if (!started.started) {
+    releaseClaim(db, key, token);
+    db.prepare("UPDATE run_profile_tracks SET error_message = ? WHERE id = ?").run(started.reason, tr.id);
+    return "deferred";
+  }
+  try {
+    const result = await send();
+    const proof = evidence(result);
+    if (!proof || !confirmAction(db, key, token, proof)) throw new Error("provider acceptance not confirmed");
+    return "sent";
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    holdUnknown(db, key, token, reason);
+    trFail(db, tr, `Action ${key} outcome unknown; review required: ${reason}`);
+    return "held";
   }
 }
 
@@ -505,12 +588,13 @@ async function executeStep(
       let visitResult: { isFirstDegree: boolean; messagingUrn: string | null };
       try { visitResult = await visitProfile(page, linkedinUrl); } finally { await page.close(); }
       await saveSessionState(accountId);
-      if (visitResult.isFirstDegree && target.degree !== 1) {
-        db.prepare("UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?").run(nowIso(), target.id);
+      if (visitResult.isFirstDegree) {
+        if (target.degree !== 1) db.prepare("UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?").run(nowIso(), target.id);
+        recordConnectedEvidence(db, { accountId, targetId: target.id, connectedAt: nowIso(), source: "linkedin_profile_visit" });
         log(db, runId, target.id, "info", `${name} already 1st-degree — backfilled connection status`);
       }
       if (visitResult.messagingUrn) {
-        db.prepare("UPDATE targets SET messaging_urn = COALESCE(messaging_urn, ?) WHERE id = ?").run(visitResult.messagingUrn, target.id);
+        recordMessagingIdentity(db, { accountId, targetId: target.id, messagingUrn: visitResult.messagingUrn });
       }
       trAdvance(db, tr, steps);
       log(db, runId, target.id, "info", `Visited ${name}`);
@@ -519,15 +603,15 @@ async function executeStep(
       if (!enforceSchedule(db, tr, runId, target.id, name, accountLimits)) return;
 
       const freshTarget = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
-      if (freshTarget.degree === 1) {
-        if (!freshTarget.connected_at) db.prepare("UPDATE targets SET connected_at = ? WHERE id = ?").run(nowIso(), target.id);
+      if (isConnectedForAccount(db, accountId, target.id)) {
         log(db, runId, target.id, "info", `${name} already connected — skipping connect step`);
         trAdvance(db, tr, steps);
         return;
       }
 
-      if (freshTarget.connection_requested_at) {
-        const hoursSinceRequest = hoursSince(freshTarget.connection_requested_at);
+      const requestedAt = getConnectionRequestedAt(db, accountId, target.id);
+      if (requestedAt) {
+        const hoursSinceRequest = hoursSince(requestedAt);
         if (hoursSinceRequest / 24 > CONNECTION_MAX_WAIT_DAYS) {
           log(db, runId, target.id, "warn", `${name} did not accept after ${CONNECTION_MAX_WAIT_DAYS} days — skipping`);
           trSkip(db, tr, `Did not accept connection after ${CONNECTION_MAX_WAIT_DAYS} days`);
@@ -543,10 +627,14 @@ async function executeStep(
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending connection request to ${name}`);
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
-      const page = await getSessionPage(accountId);
-      try { await sendConnectionRequest(page, linkedinUrl); } finally { await page.close(); }
+      const dispatched = await dispatchStep(db, tr, step, target, accountId, "connect", accountLimits.daily_connection_limit, accountLimits, linkedinUrl,
+        async () => {
+          const page = await getSessionPage(accountId);
+          try { return await sendConnectionRequest(page, linkedinUrl); } finally { await page.close(); }
+        }, result => result.evidence);
+      if (dispatched !== "sent" && dispatched !== "confirmed") return;
       await saveSessionState(accountId);
-      db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
+      recordConnectionRequested(db, { accountId, targetId: target.id, requestedAt: nowIso() });
       trWait(db, tr, CONNECTION_RECHECK_HOURS);
       log(db, runId, target.id, "info", `Connection request sent to ${name} — will recheck in ${CONNECTION_RECHECK_HOURS}h`);
 
@@ -555,8 +643,8 @@ async function executeStep(
       if (!enforceSchedule(db, tr, runId, target.id, name, accountLimits)) return;
 
       const freshTarget = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
-      if (freshTarget.degree !== 1) {
-        const requested = freshTarget.connection_requested_at;
+      if (!isConnectedForAccount(db, accountId, target.id)) {
+        const requested = getConnectionRequestedAt(db, accountId, target.id);
         if (requested && hoursSince(requested) / 24 > CONNECTION_MAX_WAIT_DAYS) {
           log(db, runId, target.id, "warn", `${name} never accepted — skipping message step`);
           trSkip(db, tr, "Never accepted connection");
@@ -632,28 +720,20 @@ async function executeStep(
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending message to ${name}`);
       const messageLinkedinUrl = await getLinkedinUrl(db, target, accountId);
-      const page = await getSessionPage(accountId);
-      try {
-        if (!target.full_name) throw new Error(`Target ${target.id} has no full_name — cannot search messaging`);
-        const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn);
-        if (result.messagingUrn) {
-          db.prepare("UPDATE targets SET messaging_urn = COALESCE(messaging_urn, ?) WHERE id = ?").run(result.messagingUrn, target.id);
-        }
-      } catch (err) {
-        if (err instanceof NotConnectedError) {
-          await saveSessionState(accountId);
-          db.prepare("UPDATE targets SET degree = NULL, connected_at = NULL WHERE id = ?").run(target.id);
-          log(db, runId, target.id, "warn", `${name} no longer appears 1st-degree — resetting connection status and rescheduling`);
-          trWait(db, tr, CONNECTION_RECHECK_HOURS);
-          return;
-        }
-        throw err;
-      } finally {
-        await page.close();
-      }
+      const dispatched = await dispatchStep(db, tr, step, target, accountId, "message", accountLimits.daily_message_limit, accountLimits, messageText,
+        async () => {
+          const page = await getSessionPage(accountId);
+          try {
+            if (!target.full_name) throw new Error(`Target ${target.id} has no full_name — cannot search messaging`);
+            const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, getMessagingIdentity(db, accountId, target.id));
+            if (result.messagingUrn) recordMessagingIdentity(db, { accountId, targetId: target.id, messagingUrn: result.messagingUrn });
+            return result;
+          } finally { await page.close(); }
+        }, result => result.evidence);
+      if (dispatched !== "sent" && dispatched !== "confirmed") return;
       await saveSessionState(accountId);
       db.prepare("UPDATE targets SET message_sent_at = ? WHERE id = ?").run(nowIso(), target.id);
-      trRecordContext(db, tr, { linkedinMessage: messageText });
+      trRecordContext(db, tr, { linkedinMessage: getAction(db, actionKey(tr.id, step.id))?.payload ?? messageText });
       trAdvance(db, tr, steps);
       log(db, runId, target.id, "info", `Message sent to ${name}`);
 
@@ -748,12 +828,14 @@ async function executeStep(
 
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending InMail to ${name}`);
-      const page = await getSessionPage(accountId);
-      try {
-        await premium.inmail.sendInMail(page, freshTarget.sales_nav_url, inmailSubject, inmailBody);
-      } finally {
-        await page.close();
-      }
+      const dispatched = await dispatchStep(db, tr, step, target, accountId, "sales_inmail", accountLimits.daily_inmail_limit, accountLimits, inmailBody,
+        async () => {
+          const page = await getSessionPage(accountId);
+          try { await premium.inmail.sendInMail(page, freshTarget.sales_nav_url, inmailSubject, inmailBody); }
+          finally { await page.close(); }
+          return "";
+        }, result => result);
+      if (dispatched !== "sent" && dispatched !== "confirmed") return;
       await saveSessionState(accountId);
       db.prepare("UPDATE targets SET inmail_sent_at = ?, message_sent_at = COALESCE(message_sent_at, ?) WHERE id = ?").run(nowIso(), nowIso(), target.id);
       trRecordContext(db, tr, { linkedinMessage: inmailBody });
@@ -895,8 +977,22 @@ async function executeStep(
       const finalEmailBody = sig ? `${emailBody}\n\n--\n${sig}` : emailBody;
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending email to ${name} <${freshTarget.email}>`);
-      await sendEmail({ ...emailAccount, password: decryptSecret(emailAccount.password)! }, freshTarget.email, emailSubject, finalEmailBody);
-      trRecordContext(db, tr, { emailSubject, emailBody });
+      const messageId = `<${randomUUID()}@${emailAccount.from_email.split("@")[1]}>`;
+      const dispatched = await dispatchStep(db, tr, step, target, emailAccountId, "email", hardLimit, emailAccountLimits, JSON.stringify({ emailSubject, emailBody }),
+        async () => {
+          registerOutboundEmail(db, {
+            actionKey: actionKey(tr.id, step.id), targetId: target.id, emailAccountId,
+            recipient: freshTarget.email!, messageId, subject: emailSubject,
+          });
+          const result = await sendEmail({ ...emailAccount, password: decryptSecret(emailAccount.password)! }, freshTarget.email!, emailSubject, finalEmailBody, { messageId });
+          if (result.accepted.map(address => address.toLowerCase()).includes(freshTarget.email!.toLowerCase())) {
+            markOutboundAccepted(db, actionKey(tr.id, step.id));
+          }
+          return result;
+        }, result => result.accepted.map(address => address.toLowerCase()).includes(freshTarget.email!.toLowerCase()) ? result.messageId : "");
+      if (dispatched !== "sent" && dispatched !== "confirmed") return;
+      const sentContent = getAction(db, actionKey(tr.id, step.id))?.payload;
+      trRecordContext(db, tr, sentContent ? JSON.parse(sentContent) as { emailSubject: string; emailBody: string } : { emailSubject, emailBody });
       trAdvance(db, tr, steps);
       log(db, runId, target.id, "info", `Email sent to ${name}`);
     }
@@ -916,7 +1012,7 @@ async function executeStep(
     }
     if (err instanceof PendingInviteError) {
       log(db, runId, target.id, "info", `${name} invite already pending — will recheck`);
-      if (!target.connection_requested_at) db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
+      if (!getConnectionRequestedAt(db, accountId, target.id)) recordConnectionRequested(db, { accountId, targetId: target.id, requestedAt: nowIso() });
       trWait(db, tr, CONNECTION_RECHECK_HOURS);
       return;
     }
@@ -1007,14 +1103,15 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
     }
   }
 
-  // LinkedIn inbox reply detection (messaging GraphQL) — once per 15min per
-  // account. Sets targets.last_replied_at so the runner auto-unenrolls repliers.
-  // LinkedIn reply detection is a premium feature (AI classifier layer) — no-op without ee/.
+  // Complete public inbox sync provides reply evidence and freshness before sends.
   for (const accountId of seenAccounts) {
-    if (premium?.replies?.shouldSyncInbox(accountId)) {
+    if (!getInboxFreshness(db, { accountId, channel: "linkedin", maxAgeMs: 15 * 60_000 }).fresh) {
       try {
         console.log(`[runner] Starting LinkedIn inbox sync for account ${accountId}`);
-        const replies = await premium.replies.syncAccountInbox(accountId);
+        const page = await getSessionPage(accountId);
+        let replies: number;
+        try { replies = await syncLinkedInInbox(db, accountId, page); }
+        finally { await page.close(); }
         console.log(`[runner] LinkedIn inbox sync complete — ${replies} new repl${replies === 1 ? "y" : "ies"}`);
         if (replies > 0) {
           for (const r of activeRuns.filter(x => x.account_id === accountId)) {
@@ -1321,7 +1418,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
       // check in executeStep). Only the former spends a daily connect slot — the recheck
       // is a free DB read and must never be blocked by the cap, or an accepted connection
       // can never hand off to the next step (it'd be rescheduled behind new sends forever).
-      if (tr.connection_requested_at) {
+      if (getConnectionRequestedAt(db, tr.account_id, tr.target_id)) {
         toExecute.push(tr);
         continue;
       }
