@@ -46,7 +46,7 @@ export function normalizeSuppressionValue(kind: SuppressionKind, raw: string): s
     const profile = /^\/in\/([^/]+)\/?$/.exec(url.pathname);
     if (profile) return `https://www.linkedin.com/in/${decodeURIComponent(profile[1]).toLowerCase()}`;
     const lead = /^\/sales\/lead\/([^/]+)\/?$/.exec(url.pathname);
-    return lead ? `https://www.linkedin.com/sales/lead/${decodeURIComponent(lead[1]).toLowerCase()}` : null;
+    return lead ? `https://www.linkedin.com/sales/lead/${decodeURIComponent(lead[1])}` : null;
   } catch { return null; }
 }
 

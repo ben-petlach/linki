@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import Database from "better-sqlite3";
-import { evaluateEligibility, initSuppressionSchema, preserveCompanySuppressionOnDelete, preserveTargetSuppressionOnDelete, suppressIdentity, suppressTarget } from "../../lib/reliability/suppression";
+import { evaluateEligibility, initSuppressionSchema, loadTargetIdentityIndex, preserveCompanySuppressionOnDelete, preserveTargetSuppressionOnDelete, suppressIdentity, suppressTarget } from "../../lib/reliability/suppression";
 import { importCsv } from "../../lib/csv-import";
 
 function fixture() {
@@ -126,6 +126,21 @@ test("CSV refuses conflicting exact identifiers and never merges by matching nam
   assert.equal(result.errors.length, 2);
   assert.equal(result.imported, 1);
   assert.equal(evaluateEligibility(db, "t3").allowed, true);
+  db.close();
+});
+
+test("Sales Nav opaque lead IDs preserve case for identity and suppression", () => {
+  const db = fixture();
+  const first = "https://www.linkedin.com/sales/lead/ACwA123,NAME_SEARCH,xYz";
+  const second = "https://www.linkedin.com/sales/lead/acwa123,NAME_SEARCH,xYz";
+  db.prepare("INSERT INTO targets (id, linkedin_url, full_name) VALUES (?, ?, 'Same Name')").run("lead1", first);
+  db.prepare("INSERT INTO targets (id, linkedin_url, full_name) VALUES (?, ?, 'Same Name')").run("lead2", second);
+  const identities = loadTargetIdentityIndex(db);
+  assert.equal(identities.profile(first), "lead1");
+  assert.equal(identities.profile(second), "lead2");
+  suppressIdentity(db, { kind: "linkedin", value: first, reason: "excluded_person" });
+  assert.equal(evaluateEligibility(db, "lead1").allowed, false);
+  assert.equal(evaluateEligibility(db, "lead2").allowed, true);
   db.close();
 });
 
