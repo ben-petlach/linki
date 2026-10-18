@@ -111,9 +111,9 @@ test("reply after accepted email blocks both channels and senders, including aft
 });
 
 test("competing workers, expired claims, unknown outcome, and late suppression stay durable", () => {
-  db.prepare("INSERT INTO companies (id, name, domain) VALUES (?, ?, ?)").run("company-one", "Example", "example.test");
+  db.prepare("INSERT INTO companies (id, name, domain) VALUES (?, ?, ?)").run("company-one", "Blocked", "blocked.test");
   db.prepare("INSERT INTO targets (id, linkedin_url, email, company_id) VALUES (?, ?, ?, ?)")
-    .run("maya", "https://www.linkedin.com/in/maya/", "maya@example.test", "company-one");
+    .run("maya", "https://www.linkedin.com/in/maya/", "maya@blocked.test", "company-one");
   const second = new Database(dbPath);
   second.pragma("foreign_keys = ON");
   const key = actionKey("ben-linkedin-track", "message-three");
@@ -125,7 +125,7 @@ test("competing workers, expired claims, unknown outcome, and late suppression s
   assert.equal(replacement.claimed, true);
   if (!replacement.claimed) return;
   assert.equal(beginDispatch(db, key, first.token, () => null, 1102).started, false);
-  suppressIdentity(second, { kind: "company_domain", value: "example.test", reason: "company_excluded" });
+  suppressIdentity(second, { kind: "company_domain", value: "blocked.test", reason: "company_excluded" });
   assert.equal(beginDispatch(second, key, replacement.token,
     () => evaluateEligibility(second, "maya", { channel: "linkedin" }).blocks[0]?.reason ?? null, 1102).started, false);
   assert.equal(getAction(second, key)?.state, "claimed");
@@ -200,9 +200,9 @@ test("production dispatch gate stops a reply race and holds uncertain provider o
   const schedule = { active_hours_start: 0, active_hours_end: 24, timezone: "UTC", working_days: "1,2,3,4,5,6,7" };
   const step = { id: "integration-step" } as Parameters<typeof dispatchStep>[2];
   let providerCalls = 0;
-  const julesTrack = { id: "jules-track", run_id: "integration-run", current_step: 0 } as Parameters<typeof dispatchStep>[1];
+  const julesTrack = { id: "jules-track", run_profile_id: "jules-profile", run_id: "integration-run", current_step: 0 } as Parameters<typeof dispatchStep>[1];
   const race = await dispatchStep(db, julesTrack, step, { id: "jules" } as Parameters<typeof dispatchStep>[3],
-    "ben", "connect", 10, schedule, "fixture", async beforeSend => {
+    "ben", "connect", 10, schedule, "fixture", "https://www.linkedin.com/in/jules/", async beforeSend => {
       suppressTarget(db, "jules", "inbound_reply", "fixture-reply");
       beforeSend();
       providerCalls++;
@@ -212,21 +212,83 @@ test("production dispatch gate stops a reply race and holds uncertain provider o
   assert.equal(providerCalls, 0);
   assert.equal(getAction(db, actionKey("jules-track", "integration-step")), undefined);
 
-  const robinTrack = { id: "robin-track", run_id: "integration-run", current_step: 0 } as Parameters<typeof dispatchStep>[1];
+  const robinTrack = { id: "robin-track", run_profile_id: "robin-profile", run_id: "integration-run", current_step: 0 } as Parameters<typeof dispatchStep>[1];
   const uncertain = await dispatchStep(db, robinTrack, step, { id: "robin" } as Parameters<typeof dispatchStep>[3],
-    "ben", "connect", 10, schedule, "fixture", async beforeSend => {
+    "ben", "connect", 10, schedule, "fixture", "https://www.linkedin.com/in/robin/", async beforeSend => {
       beforeSend();
       providerCalls++;
       throw new Error("provider response lost");
     }, () => "fixture-accepted");
-  assert.equal(uncertain, "held");
+  assert.equal(uncertain, "held", (db.prepare("SELECT error_message FROM run_profile_tracks WHERE id = 'robin-track'").get() as { error_message: string }).error_message);
   assert.equal(providerCalls, 1);
   assert.equal(getAction(db, actionKey("robin-track", "integration-step"))?.state, "unknown");
   const retry = await dispatchStep(db, robinTrack, step, { id: "robin" } as Parameters<typeof dispatchStep>[3],
-    "ben", "connect", 10, schedule, "fixture", async () => {
+    "ben", "connect", 10, schedule, "fixture", "https://www.linkedin.com/in/robin/", async () => {
       providerCalls++;
       return { acknowledgement: "duplicate" };
     }, result => result.acknowledgement);
   assert.equal(retry, "held");
   assert.equal(providerCalls, 1);
+
+  for (const targetId of ["eli", "faye", "gail", "dana"]) {
+    db.prepare("INSERT INTO targets (id, linkedin_url, email) VALUES (?, ?, ?)")
+      .run(targetId, `https://www.linkedin.com/in/${targetId}/`, `${targetId}@example.test`);
+    db.prepare("INSERT INTO run_profiles (id, run_id, target_id, email_account_id) VALUES (?, ?, ?, ?)")
+      .run(`${targetId}-profile`, "integration-run", targetId, targetId === "dana" ? "ben-mail" : null);
+    db.prepare(`INSERT INTO run_profile_tracks (id, run_profile_id, track, state, current_step)
+      VALUES (?, ?, ?, 'in_progress', 0)`).run(`${targetId}-track`, `${targetId}-profile`, targetId === "dana" ? "email" : "linkedin");
+  }
+  const track = (id: string) => ({ id: `${id}-track`, run_profile_id: `${id}-profile`, run_id: "integration-run", current_step: 0 }) as Parameters<typeof dispatchStep>[1];
+  const target = (id: string) => ({ id }) as Parameters<typeof dispatchStep>[3];
+
+  const excluded = await dispatchStep(db, track("eli"), step, target("eli"), "ben", "connect", 10,
+    schedule, "fixture", "https://www.linkedin.com/in/eli/", async beforeSend => {
+      suppressIdentity(db, { kind: "linkedin", value: "https://www.linkedin.com/in/eli/",
+        reason: "company_already_contacted", scope: "net_new" });
+      beforeSend();
+      providerCalls++;
+      return { acknowledgement: "unexpected" };
+    }, result => result.acknowledgement);
+  assert.equal(excluded, "deferred");
+  assert.equal(providerCalls, 1);
+  assert.match((db.prepare("SELECT error_message FROM run_profile_tracks WHERE id = 'eli-track'").get() as { error_message: string }).error_message,
+    /company_already_contacted/);
+
+  db.prepare("UPDATE email_accounts SET is_verified = 1 WHERE id = 'ben-mail'").run();
+  recordInboxSyncSuccess(db, { accountId: "ben-mail", channel: "email", completedAt: new Date().toISOString() });
+  const changedRecipient = await dispatchStep(db, track("dana"), step, target("dana"), "ben-mail", "email", 10,
+    schedule, "fixture", "dana@example.test", async beforeSend => {
+      db.prepare("UPDATE targets SET email = 'dana-new@example.test' WHERE id = 'dana'").run();
+      suppressIdentity(db, { kind: "email", value: "dana@example.test", reason: "old_address_excluded" });
+      beforeSend();
+      providerCalls++;
+      return { acknowledgement: "unexpected" };
+    }, result => result.acknowledgement);
+  assert.equal(changedRecipient, "deferred");
+  assert.equal(providerCalls, 1);
+  assert.match((db.prepare("SELECT error_message FROM run_profile_tracks WHERE id = 'dana-track'").get() as { error_message: string }).error_message,
+    /recipient identity changed/);
+
+  const changedSender = await dispatchStep(db, track("faye"), step, target("faye"), "ben", "connect", 10,
+    schedule, "fixture", "https://www.linkedin.com/in/faye/", async beforeSend => {
+      db.prepare("UPDATE accounts SET email = 'changed@example.test' WHERE id = 'ben'").run();
+      beforeSend();
+      providerCalls++;
+      return { acknowledgement: "unexpected" };
+    }, result => result.acknowledgement);
+  assert.equal(changedSender, "deferred");
+  assert.equal(providerCalls, 1);
+  assert.match((db.prepare("SELECT error_message FROM run_profile_tracks WHERE id = 'faye-track'").get() as { error_message: string }).error_message,
+    /LinkedIn sender changed/);
+  db.prepare("UPDATE accounts SET email = 'ben@example.test' WHERE id = 'ben'").run();
+
+  const accepted = await dispatchStep(db, track("gail"), step, target("gail"), "ben", "connect", 10,
+    schedule, "fixture", "https://www.linkedin.com/in/gail/", async beforeSend => {
+      beforeSend();
+      providerCalls++;
+      return { acknowledgement: "fixture acceptance" };
+    }, result => result.acknowledgement);
+  assert.equal(accepted, "sent");
+  assert.equal(providerCalls, 2);
+  assert.equal(getAction(db, actionKey("gail-track", "integration-step"))?.state, "confirmed");
 });
