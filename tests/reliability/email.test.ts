@@ -93,7 +93,7 @@ test("SMTP connection rejects local self-signed STARTTLS certificate", async () 
     const result = await testSmtpConnection({ from_email: "sender@sender.test", from_name: null,
       smtp_host: "127.0.0.1", smtp_port: port, smtp_secure: 0,
       username: "sender", password: "pass" });
-    assert.ok(result, "self-signed certificate must fail connection verification");
+    assert.match(result ?? "", /certificate|self.signed/i, "self-signed certificate must fail connection verification");
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
@@ -156,5 +156,41 @@ test("reply after SMTP acceptance but before local acknowledgement still pauses 
     assert.equal(await processInboundEmail(db, "account", raw({ id: "crash-window@example.com", references: "<sent-a@sender.test>" })), "reply");
     assert.equal(evaluateEligibility(db, "a", { channel: "email" }).allowed, false);
     assert.equal((db.prepare("SELECT accepted_at FROM email_outbound WHERE action_key='send-a'").get() as { accepted_at: string | null }).accepted_at, null);
+  } finally { db.close(); }
+});
+
+
+test("direct send enforces verified sender and daily cap before SMTP", async () => {
+  const db = fixture();
+  const input = {
+    targetId: "a", recipient: "alice@example.com", subject: "Hello", body: "Test",
+    idempotencyKey: "fixed-request-123", account: {
+      id: "account", from_email: "sender@sender.test", from_name: null,
+      smtp_host: "127.0.0.1", smtp_port: 1, smtp_secure: 0,
+      username: "sender", password: "pass",
+    },
+  };
+  try {
+    db.prepare("UPDATE email_accounts SET is_verified=0 WHERE id='account'").run();
+    const unverified = await sendDirectEmail(db, input);
+    assert.equal(unverified.ok, false);
+    if (!unverified.ok) assert.match(unverified.error, /not verified/);
+    db.prepare("UPDATE email_accounts SET is_verified=1, daily_email_limit=1 WHERE id='account'").run();
+    registerOutboundEmail(db, { actionKey: "already-today", targetId: "b", emailAccountId: "account",
+      recipient: "bob@example.com", messageId: "<sent-b@sender.test>", subject: "Hello" });
+    const capped = await sendDirectEmail(db, input);
+    assert.equal(capped.ok, false);
+    if (!capped.ok) assert.match(capped.error, /Daily email limit/);
+  } finally { db.close(); }
+});
+
+test("reusing action key with changed payload is rejected", () => {
+  const db = fixture();
+  try {
+    registerOutboundEmail(db, { actionKey: "same", targetId: "a", emailAccountId: "account",
+      recipient: "alice@example.com", messageId: "<same@sender.test>", subject: "Hello", payloadHash: "old" });
+    assert.throws(() => registerOutboundEmail(db, { actionKey: "same", targetId: "a", emailAccountId: "account",
+      recipient: "alice@example.com", messageId: "<same@sender.test>", subject: "Hello", payloadHash: "new" }),
+      /reused with different/);
   } finally { db.close(); }
 });
