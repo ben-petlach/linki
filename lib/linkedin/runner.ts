@@ -391,7 +391,13 @@ export async function dispatchStep<T>(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (getAction(db, key)?.state === "claimed") {
-      releaseClaim(db, key, token);
+      db.transaction(() => {
+        if (releaseClaim(db, key, token) && channel === "email") {
+          // No provider call can happen while action is still claimed. A pre-send
+          // refusal may be retried with edited content and a new subject.
+          db.prepare("DELETE FROM email_outbound WHERE action_key = ? AND accepted_at IS NULL").run(key);
+        }
+      }).immediate();
       if (error instanceof DispatchBlockedError) {
         db.prepare("UPDATE run_profile_tracks SET error_message = ? WHERE id = ?").run(reason, tr.id);
         trWait(db, tr, 0.25);
