@@ -3,10 +3,16 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { SMTPServer } from "smtp-server";
 import net from "node:net";
+import tls from "node:tls";
+import { spawn, execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { initEmailReliabilitySchema, registerOutboundEmail, markOutboundAccepted, processInboundEmail, syncEmailInbox, isEmailInboxFresh } from "../../lib/email/inbox";
-import { initSuppressionSchema, evaluateEligibility } from "../../lib/reliability/suppression";
+import { initSuppressionSchema, evaluateEligibility, suppressIdentity } from "../../lib/reliability/suppression";
 import { testSmtpConnection } from "../../lib/email/sender";
 import { sendDirectEmail } from "../../lib/email/direct";
+import { initInboxStateSchema, recordInboxSyncSuccess } from "../../lib/reliability/inbox-state";
 
 function fixture() {
   const db = new Database(":memory:");
@@ -44,8 +50,9 @@ test("only exact outbound threading counts; duplicate inbound message is idempot
   const db = fixture();
   try {
     assert.equal(await processInboundEmail(db, "account", raw({ id: "old@example.com", date: "Thu, 1 Jan 2026 12:00:00 +0000" })), "ignored");
-    assert.equal(await processInboundEmail(db, "account", raw({ id: "unrelated@example.com" })), "ignored");
-    assert.equal(await processInboundEmail(db, "account", raw({ id: "wrong@example.com", references: "<other@sender.test>" })), "ignored");
+    assert.equal(await processInboundEmail(db, "account", raw({ id: "unrelated@example.com" })), "ambiguous");
+    assert.equal((db.prepare("SELECT count(*) c FROM email_replies").get() as { c: number }).c, 0);
+    assert.equal(await processInboundEmail(db, "account", raw({ id: "wrong@example.com", from: "mallory@example.net", references: "<other@sender.test>" })), "ignored");
     assert.equal(await processInboundEmail(db, "account", raw({ id: "reply@example.com", references: "<sent-a@sender.test>" })), "reply");
     assert.equal(await processInboundEmail(db, "account", raw({ id: "reply@example.com", references: "<sent-a@sender.test>" })), "duplicate");
     assert.equal((db.prepare("SELECT count(*) c FROM email_replies").get() as { c: number }).c, 1);
@@ -193,4 +200,130 @@ test("reusing action key with changed payload is rejected", () => {
       recipient: "alice@example.com", messageId: "<same@sender.test>", subject: "Hello", payloadHash: "new" }),
       /reused with different/);
   } finally { db.close(); }
+});
+
+
+test("complete local TLS IMAP scan captures threaded reply and marks inbox fresh", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "linki-imap-"));
+  const cert = join(dir, "cert.pem");
+  const key = join(dir, "key.pem");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+    "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1"],
+    { stdio: "ignore" });
+  const message = raw({ id: "imap-reply@example.com", references: "<sent-a@sender.test>" });
+  let sawFetch = false;
+  const server = tls.createServer({ key: readFileSync(key), cert: readFileSync(cert) }, socket => {
+    socket.write("* OK local IMAP ready\r\n");
+    let pending = "";
+    socket.on("data", chunk => {
+      pending += chunk.toString();
+      for (;;) {
+        const end = pending.indexOf("\r\n");
+        if (end < 0) break;
+        const line = pending.slice(0, end);
+        pending = pending.slice(end + 2);
+        const tag = line.split(" ")[0];
+        const command = line.toUpperCase();
+        if (command.includes("CAPABILITY")) socket.write(`* CAPABILITY IMAP4rev1 UIDPLUS\r\n${tag} OK capability\r\n`);
+        else if (command.includes("LOGIN")) socket.write(`${tag} OK login\r\n`);
+        else if (command.includes("EXAMINE") || command.includes("SELECT"))
+          socket.write(`* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n${tag} OK [READ-ONLY] selected\r\n`);
+        else if (command.includes("SEARCH")) socket.write(`* SEARCH 1\r\n${tag} OK search\r\n`);
+        else if (command.includes("FETCH")) {
+          sawFetch = true;
+          socket.write(`* 1 FETCH (UID 1 BODY[] {${Buffer.byteLength(message)}}\r\n${message}\r\n)\r\n${tag} OK fetch\r\n`);
+        } else if (command.includes("LOGOUT")) {
+          socket.write(`* BYE closing\r\n${tag} OK logout\r\n`);
+          socket.end();
+        } else socket.write(`${tag} OK done\r\n`);
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const dbPath = join(dir, "test.sqlite");
+  const memory = fixture();
+  await memory.backup(dbPath);
+  memory.close();
+  const db = new Database(dbPath);
+  const port = (server.address() as { port: number }).port;
+  db.prepare("UPDATE email_accounts SET imap_host='127.0.0.1', imap_port=? WHERE id='account'").run(port);
+  db.close();
+  try {
+    const childPath = resolve("tests/reliability/fixtures/imap-sync-child.ts");
+    const output = await new Promise<string>((resolveOutput, reject) => {
+      const child = spawn(resolve("node_modules/.bin/tsx"), [childPath, dbPath], {
+        env: { ...process.env, NODE_EXTRA_CA_CERTS: cert }, stdio: ["ignore", "pipe", "pipe"] });
+      let out = ""; let error = "";
+      child.stdout.on("data", data => { out += data; });
+      child.stderr.on("data", data => { error += data; });
+      child.on("error", reject);
+      child.on("close", code => code === 0 ? resolveOutput(out) : reject(new Error(error)));
+    });
+    assert.match(output, /"replies":1/);
+    assert.equal(sawFetch, true);
+    const verify = new Database(dbPath);
+    try {
+      assert.equal((verify.prepare("SELECT count(*) c FROM email_replies").get() as { c: number }).c, 1);
+      assert.equal(isEmailInboxFresh(verify, "account").fresh, true);
+    } finally { verify.close(); }
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("local TLS SMTP sends once per direct action and late suppression blocks next action", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "linki-smtp-"));
+  const cert = join(dir, "cert.pem");
+  const key = join(dir, "key.pem");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+    "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1"],
+    { stdio: "ignore" });
+  let received = 0;
+  const server = new SMTPServer({ secure: true, key: readFileSync(key), cert: readFileSync(cert),
+    authOptional: true, onAuth(auth, _session, callback) { callback(null, { user: auth.username }); },
+    onData(stream, _session, callback) {
+      stream.on("data", () => {});
+      stream.on("end", () => { received++; callback(); });
+    },
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const dbPath = join(dir, "test.sqlite");
+  const memory = fixture();
+  await memory.backup(dbPath);
+  memory.close();
+  const db = new Database(dbPath);
+  initInboxStateSchema(db);
+  recordInboxSyncSuccess(db, { accountId: "account", channel: "email" });
+  db.close();
+  const port = (server.server.address() as { port: number }).port;
+  const childPath = resolve("tests/reliability/fixtures/direct-send-child.ts");
+  async function invoke(idempotencyKey: string): Promise<{ ok: boolean; error?: string }> {
+    const output = await new Promise<string>((resolveOutput, reject) => {
+      const child = spawn(resolve("node_modules/.bin/tsx"), [childPath, dbPath, String(port), idempotencyKey], {
+        env: { ...process.env, NODE_EXTRA_CA_CERTS: cert }, stdio: ["ignore", "pipe", "pipe"] });
+      let out = ""; let error = "";
+      child.stdout.on("data", data => { out += data; });
+      child.stderr.on("data", data => { error += data; });
+      child.on("error", reject);
+      child.on("close", code => code === 0 ? resolveOutput(out) : reject(new Error(error)));
+    });
+    return JSON.parse(output);
+  }
+  try {
+    assert.equal((await invoke("direct-request-1")).ok, true);
+    assert.equal((await invoke("direct-request-1")).ok, false);
+    assert.equal(received, 1);
+    const update = new Database(dbPath);
+    try { suppressIdentity(update, { kind: "email", value: "alice@example.com", reason: "unsubscribe" }); }
+    finally { update.close(); }
+    const blocked = await invoke("direct-request-2");
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.error ?? "", /Suppressed/);
+    assert.equal(received, 1);
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

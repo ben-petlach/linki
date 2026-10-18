@@ -56,6 +56,11 @@ function gate(db: Database.Database, targetId: string, accountId: string, recipi
     .get(targetId) as { email: string | null; email_status: string | null } | undefined;
   if (!target || target.email?.trim().toLowerCase() !== recipient.trim().toLowerCase()) return "Recipient identity changed";
   if (target.email_status === "invalid") return "Email address invalid";
+  const assignment = db.prepare(`SELECT COUNT(*) AS total,
+    SUM(CASE WHEN email_account_id = ? THEN 1 ELSE 0 END) AS matching
+    FROM run_profiles WHERE target_id = ? AND email_account_id IS NOT NULL`)
+    .get(accountId, targetId) as { total: number; matching: number | null };
+  if (assignment.total > 0 && !assignment.matching) return "Sending account is not assigned to contact";
   const eligibility = evaluateEligibility(db, targetId, { channel: "email" });
   const manualBlocks = eligibility.blocks.filter(block => block.reason !== "inbound_reply");
   if (manualBlocks.length) return `Suppressed: ${manualBlocks.map(block => block.reason).join(", ")}`;

@@ -1,6 +1,6 @@
 import Imap from "imap";
 import { simpleParser, type ParsedMail } from "mailparser";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import type Database from "better-sqlite3";
 import { getDb } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
@@ -89,11 +89,10 @@ function headerIds(mail: ParsedMail): string[] {
 }
 
 /** Returns true only when a durable state change was made. */
-export async function processInboundEmail(db: Db, emailAccountId: string, raw: Buffer | string): Promise<"reply" | "unsubscribe" | "bounce" | "ignored" | "duplicate"> {
+export async function processInboundEmail(db: Db, emailAccountId: string, raw: Buffer | string): Promise<"reply" | "unsubscribe" | "bounce" | "ambiguous" | "ignored" | "duplicate"> {
   initEmailReliabilitySchema(db);
   const mail = await simpleParser(raw);
-  const messageId = normalizedMessageId(mail.messageId);
-  if (!messageId) return "ignored"; // Cannot deduplicate a message without stable identity.
+  const messageId = normalizedMessageId(mail.messageId) || `sha256:${createHash("sha256").update(raw).digest("hex")}`;
   const duplicate = db.prepare("SELECT 1 FROM email_inbound WHERE email_account_id = ? AND message_id = ?")
     .get(emailAccountId, messageId);
   if (duplicate) return "duplicate";
@@ -101,18 +100,19 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
   const from = address(mail);
   const body = textBody(mail);
   const ids = headerIds(mail);
+  let threaded = false;
   let matched: { target_id: string; recipient_email: string; accepted_at: string | null; created_at: string } | undefined;
   for (const id of ids) {
     matched = db.prepare(`SELECT target_id, recipient_email, accepted_at, created_at FROM email_outbound
       WHERE email_account_id = ? AND message_id = ?`).get(emailAccountId, id) as typeof matched;
-    if (matched) break;
+    if (matched) { threaded = true; break; }
   }
   const isDsn = /mailer-daemon|postmaster|mail-delivery-subsystem|delivery-status/i.test(from);
   const finalRecipient = isDsn ? body.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i)?.[1]?.toLowerCase() : undefined;
   const unsubscribed = /\b(unsubscribe|remove me|stop emailing|do not email|don't email|opt out)\b/i.test(body);
   // Unthreaded opt-outs and DSNs use exact address plus accepted outbound chronology.
   // Ordinary replies require RFC threading IDs; old unrelated email cannot pause a campaign.
-  if (!matched && (finalRecipient || (unsubscribed && from))) {
+  if (!matched && (finalRecipient || from)) {
     matched = db.prepare(`SELECT target_id, recipient_email, accepted_at, created_at FROM email_outbound
       WHERE email_account_id = ? AND recipient_email = ? AND accepted_at IS NOT NULL AND accepted_at <= ?
       ORDER BY accepted_at DESC LIMIT 1`).get(emailAccountId, finalRecipient ?? from, receivedAt) as typeof matched;
@@ -133,6 +133,14 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
     return "bounce";
   }
   if (from !== matched.recipient_email) return "ignored";
+  if (!threaded && !unsubscribed) {
+    db.transaction(() => {
+      db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, 'ambiguous', ?)")
+        .run(emailAccountId, messageId, matched!.target_id, receivedAt);
+      suppressTarget(db, matched!.target_id, "ambiguous_inbound", messageId);
+    })();
+    return "ambiguous";
+  }
   const kind = unsubscribed ? "unsubscribe" : "reply";
   db.transaction(() => {
     db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, ?, ?)")
