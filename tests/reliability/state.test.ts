@@ -110,6 +110,10 @@ test("older inbox scan cannot clear newer failure; future timestamp blocks", () 
   initInboxStateSchema(db);
   const base = { accountId: "ben", channel: "email" as const };
   recordInboxSyncFailure(db, { ...base, startedAt: "2026-10-17T11:30:00Z", failedAt: "2026-10-17T11:40:00Z", error: "partial" });
+  recordInboxSyncFailure(db, { ...base, startedAt: "2026-10-17T11:10:00Z", failedAt: "2026-10-17T11:45:00Z", error: "older scan" });
+  recordInboxSyncSuccess(db, { ...base, startedAt: "2026-10-17T11:20:00Z", completedAt: "2026-10-17T11:48:00Z" });
+  assert.equal(getInboxFreshness(db, { ...base, maxAgeMs: 3600000,
+    now: new Date("2026-10-17T12:00:00Z") }).reason, "sync_failed");
   recordInboxSyncSuccess(db, { ...base, startedAt: "2026-10-17T11:00:00Z", completedAt: "2026-10-17T11:50:00Z" });
   const freshness = () => getInboxFreshness(db, { ...base, maxAgeMs: 3600000, now: new Date("2026-10-17T12:00:00Z") });
   assert.equal(freshness().reason, "sync_failed");

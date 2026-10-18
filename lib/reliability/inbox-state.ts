@@ -69,14 +69,20 @@ export function recordInboxSyncFailure(
     INSERT INTO inbox_sync_state (account_id, channel, last_failure_at, last_failure_started_at, last_failure)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(account_id, channel) DO UPDATE SET
-      last_failure_at = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
-        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at
+      last_failure_at = CASE WHEN (inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at)
+        AND (inbox_sync_state.last_failure_started_at IS NULL
+          OR excluded.last_failure_started_at >= inbox_sync_state.last_failure_started_at)
         THEN excluded.last_failure_at ELSE inbox_sync_state.last_failure_at END,
-      last_failure_started_at = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
-        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at
+      last_failure_started_at = CASE WHEN (inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at)
+        AND (inbox_sync_state.last_failure_started_at IS NULL
+          OR excluded.last_failure_started_at >= inbox_sync_state.last_failure_started_at)
         THEN excluded.last_failure_started_at ELSE inbox_sync_state.last_failure_started_at END,
-      last_failure = CASE WHEN inbox_sync_state.last_success_started_at IS NULL
-        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at
+      last_failure = CASE WHEN (inbox_sync_state.last_success_started_at IS NULL
+        OR excluded.last_failure_started_at >= inbox_sync_state.last_success_started_at)
+        AND (inbox_sync_state.last_failure_started_at IS NULL
+          OR excluded.last_failure_started_at >= inbox_sync_state.last_failure_started_at)
         THEN excluded.last_failure ELSE inbox_sync_state.last_failure END
   `).run(input.accountId, input.channel, failedAt, startedAt, input.error);
 }
