@@ -23,9 +23,12 @@ function response() {
 }
 
 test("actual enrollment routes reject suppression and duplicate enrollment", async () => {
-  const [{ getDb }, { default: createRun }, { default: enroll }, { suppressIdentity }] = await Promise.all([
+  const [{ getDb }, { default: createRun }, { default: enroll }, { suppressIdentity }, { insertContacts }, { insertProfiles }, { importCsv }, { evaluateEligibility }, { default: targetApi }, { default: targetsApi }] = await Promise.all([
     import("../../lib/db"), import("../../pages/api/runs/index"),
     import("../../pages/api/runs/[id]/enroll"), import("../../lib/reliability/suppression"),
+    import("../../lib/apollo-import"), import("../../lib/import-jobs"),
+    import("../../lib/csv-import"), import("../../lib/reliability/suppression"),
+    import("../../pages/api/targets/[id]"), import("../../pages/api/targets/index"),
   ]);
   const db = getDb();
   db.exec(`
@@ -81,6 +84,45 @@ test("actual enrollment routes reject suppression and duplicate enrollment", asy
   const outcomes = await Promise.all(workers.map((worker) => worker.done));
   assert.equal(outcomes.reduce((n, outcome) => n + ((outcome.body as { enrolled: number }).enrolled ?? 0), 0), 1);
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM run_profiles WHERE target_id = 't4'").get() as {n:number}).n, 1);
+
+  db.prepare("INSERT INTO lists (id, name) VALUES ('l2', 'Second List')").run();
+  const contact = (linkedinUrl: string, email: string) => ({
+    personId: null, linkedinUrl, firstName: "One", lastName: "Person", fullName: "One Person",
+    title: null, headline: null, email, emailStatus: null, phone: null, city: null,
+    country: null, timeZone: null, location: null, organizationName: null, organization: null,
+  });
+  const apollo = insertContacts(db, "l2", [
+    contact("https://linkedin.com/in/ONE/?trk=import", "one@prospect.com"),
+    contact("https://www.linkedin.com/in/new-person", "new@prospect.com"),
+    contact("https://www.linkedin.com/in/one", "two@prospect.com"),
+  ]);
+  assert.equal(apollo.imported, 2);
+  assert.equal(apollo.skipped, 1);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM targets WHERE full_name = 'One Person'").get() as {n:number}).n, 2);
+
+  const salesProfile = (linkedinUrl: string | null) => ({
+    linkedinUrl, salesNavUrl: "https://www.linkedin.com/sales/lead/ACw123,NAME_SEARCH,abc",
+    firstName: "One", lastName: "Person", fullName: "One Person", title: null,
+    company: null, location: null, degree: null, objectUrn: null, summary: null,
+    openLink: false, companyIndustry: null, companyLocation: null, tenureMonths: null,
+    spotlightBadges: null,
+  });
+  const salesNav = insertProfiles(db, "l2", [salesProfile("https://www.linkedin.com/in/one/"), salesProfile(null)]);
+  assert.equal(salesNav.imported, 0); // both exact aliases already in l2
+  assert.equal(salesNav.skipped, 2);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM targets WHERE sales_nav_url LIKE '%ACw123%'").get() as {n:number}).n, 1);
+
+  const csv = importCsv(db, "l2", "linkedin_url,email,first_name,last_name\nhttps://linkedin.com/in/one/,new-address@prospect.com,One,Person\n");
+  assert.equal(csv.errors.length, 0);
+  assert.equal(evaluateEligibility(db, "t1", { channel: "email" }).allowed, false); // unsubscribe carried across verified profile
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM targets WHERE email = 'new-address@prospect.com'").get() as {n:number}).n, 1);
+  const patch = response();
+  targetApi({ method: "PATCH", query: { id: "t1" }, body: { email: "third-address@prospect.com" } } as unknown as NextApiRequest, patch.res);
+  assert.equal(patch.result().status, 200);
+  assert.equal(evaluateEligibility(db, "t1").allowed, false);
+  const duplicate = response();
+  targetsApi({ method: "POST", body: { full_name: "Unrelated Name", linkedin_url: "https://linkedin.com/in/ONE/?ref=again" } } as NextApiRequest, duplicate.res);
+  assert.equal(duplicate.result().status, 409);
   db.close();
   rmSync(dir, { recursive: true, force: true });
 });

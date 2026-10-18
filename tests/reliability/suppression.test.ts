@@ -48,7 +48,23 @@ test("company exclusions apply across contacts; sourced-only remains eligible fo
   assert.equal(evaluateEligibility(db, "t2", { netNew: true }).allowed, false);
   assert.equal(evaluateEligibility(db, "t3", { netNew: true }).allowed, true);
   assert.equal(evaluateEligibility(db, "t1", { netNew: false }).allowed, true);
+  assert.equal(evaluateEligibility(db, "t1", { checkNetNewRules: true }).allowed, false);
   assert.equal(evaluateEligibility(db, "t2", { netNew: true }).blocks[0].evidence, "crm-42");
+  db.prepare("UPDATE targets SET company_id = NULL WHERE id = 't1'").run();
+  assert.equal(evaluateEligibility(db, "t1", { netNew: true }).allowed, false); // exact email domain rule
+  db.close();
+});
+
+test("existing outreach history excludes person and verified company from net-new enrollment", () => {
+  const db = fixture();
+  assert.equal(evaluateEligibility(db, "t1", { netNew: true }).allowed, true);
+  db.prepare("UPDATE targets SET connection_requested_at = '2026-01-02' WHERE id = 't1'").run();
+  const peer = evaluateEligibility(db, "t2", { netNew: true });
+  assert.equal(peer.allowed, false);
+  assert.equal(peer.blocks[0].kind, "company");
+  assert.equal(peer.blocks[0].evidence, "target:t1:2026-01-02");
+  assert.equal(evaluateEligibility(db, "t3", { netNew: true }).allowed, true);
+  assert.equal(evaluateEligibility(db, "t2", { netNew: false }).allowed, true);
   db.close();
 });
 
@@ -96,8 +112,11 @@ test("deleting a suppressed company preserves its existing contacts' exclusions"
   preserveCompanySuppressionOnDelete(db, "c1");
   db.prepare("UPDATE targets SET company_id = NULL WHERE company_id = 'c1'").run();
   db.prepare("DELETE FROM companies WHERE id = 'c1'").run();
+  db.prepare("INSERT INTO companies (id, domain) VALUES ('replacement', 'example.com')").run();
+  db.prepare("INSERT INTO targets (id, email, company_id) VALUES ('t4', 'fresh@example.com', 'replacement')").run();
   assert.equal(evaluateEligibility(db, "t1").allowed, false);
   assert.equal(evaluateEligibility(db, "t2").allowed, false);
+  assert.equal(evaluateEligibility(db, "t4").allowed, false);
   assert.equal(evaluateEligibility(db, "t3").allowed, true);
   db.close();
 });

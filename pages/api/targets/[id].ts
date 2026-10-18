@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
-import { preserveTargetSuppressionOnDelete } from "@/lib/reliability/suppression";
+import { loadTargetIdentityIndex, preserveSuppressionBeforeEmailUpdate, preserveTargetSuppressionOnDelete } from "@/lib/reliability/suppression";
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   const db = getDb();
@@ -32,6 +32,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     ] as const;
 
     const body = req.body as Record<string, unknown>;
+    if (typeof body.email === "string" && body.email.trim()) {
+      const owner = loadTargetIdentityIndex(db).email(body.email);
+      if (owner === null || (owner && owner !== id)) return res.status(409).json({ error: "email identity belongs to another contact or is ambiguous" });
+      preserveSuppressionBeforeEmailUpdate(db, id, body.email);
+    }
     const fields: string[] = [];
     const params: unknown[] = [];
     for (const col of EDITABLE) {
