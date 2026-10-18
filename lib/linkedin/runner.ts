@@ -1006,6 +1006,7 @@ async function executeStep(
     }
     if (err instanceof AlreadyConnectedError) {
       log(db, runId, target.id, "info", `${name} already connected — advancing`);
+      recordConnectedEvidence(db, { accountId, targetId: target.id, connectedAt: nowIso(), source: "linkedin_exact_profile_card" });
       db.prepare("UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?").run(nowIso(), target.id);
       trAdvance(db, tr, steps);
       return;
