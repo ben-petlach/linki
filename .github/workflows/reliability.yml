@@ -55,8 +55,8 @@ jobs:
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: linki-ci:${{ github.sha }}
-          format: table
-          output: container-vulnerabilities.txt
+          format: json
+          output: container-vulnerabilities.json
           severity: HIGH,CRITICAL
           exit-code: '1'
           scanners: vuln
@@ -65,5 +65,5 @@ jobs:
         if: always()
         with:
           name: container-security-${{ github.sha }}
-          path: container-vulnerabilities.txt
+          path: container-vulnerabilities.json
           if-no-files-found: ignore
