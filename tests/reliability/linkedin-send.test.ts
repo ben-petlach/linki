@@ -19,7 +19,7 @@ async function fixture(composeRecipient: string, acknowledge: boolean) {
   await page.route("https://www.linkedin.com/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/voyager/api/me") {
-      await route.fulfill({ json: { data: {}, included: [{ entityUrn: "urn:li:fs_miniProfile:ACoAAASELF", dashEntityUrn: self }] } });
+      await route.fulfill({ json: { data: { "*miniProfile": "urn:li:fs_miniProfile:ACoAAASELF" }, included: [{ entityUrn: "urn:li:fs_miniProfile:ACoAAASELF", dashEntityUrn: self }] } });
     } else if (url.searchParams.get("queryId")?.startsWith("messengerConversations")) {
       await route.fulfill({ json: { data: { data: { messengerConversationsByCategoryQuery: { metadata: {}, elements: sent ? [{
         entityUrn: `urn:li:msg_conversation:(${self},2-thread)`,

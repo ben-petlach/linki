@@ -52,23 +52,53 @@ function resolveRows(collection: Json, index: Map<string, Json>): Json[] {
   });
 }
 
-function collection(raw: Json, name: string): { rows: Json[]; metadata: Json } {
-  const node = object(object(raw.data)?.data)?.[name];
+function collection(raw: Json, name: string): { rows: Json[]; metadata: Json; index: Map<string, Json> } {
+  const root = object(object(raw.data)?.data) ?? object(raw.data);
+  const node = root?.[name];
   const item = object(node);
   if (!item) throw new IncompleteLinkedInInboxError(`LinkedIn ${name} collection missing`);
   const metadata = object(item.metadata);
   if (name === "messengerConversationsByCategoryQuery" && !metadata) {
     throw new IncompleteLinkedInInboxError("LinkedIn inbox pagination metadata missing");
   }
-  return { rows: resolveRows(item, includedIndex(raw)), metadata: metadata ?? {} };
+  const index = includedIndex(raw);
+  return { rows: resolveRows(item, index), metadata: metadata ?? {}, index };
+}
+
+function resolveField(value: Json, name: string, index: Map<string, Json>): Json | null {
+  const raw = value[`*${name}`] ?? value[name];
+  return typeof raw === "string" ? index.get(raw) ?? null : object(raw);
+}
+
+function resolveList(value: Json, name: string, index: Map<string, Json>): Json[] | null {
+  const raw = value[`*${name}`] ?? value[name];
+  if (!Array.isArray(raw)) return null;
+  const resolved = raw.map((row) => typeof row === "string" ? index.get(row) : object(row));
+  return resolved.every((row): row is Json => !!row) ? resolved : null;
 }
 
 function participantUrn(value: Json): string | null {
-  return typeof value.hostIdentityUrn === "string" ? value.hostIdentityUrn : null;
+  if (typeof value.hostIdentityUrn === "string") return value.hostIdentityUrn;
+  const mini = object(object(value["com.linkedin.voyager.messaging.MessagingMember"])?.miniProfile);
+  const legacy = mini?.dashEntityUrn ?? mini?.entityUrn;
+  return typeof legacy === "string" ? legacy.replace("fs_miniProfile", "fsd_profile") : null;
 }
 
-function participantProfile(value: Json): string | null {
-  return normalizedProfileUrl(String(object(object(value.participantType)?.member)?.profileUrl ?? ""));
+function messageSenderUrn(message: Json, index: Map<string, Json>): string | null {
+  const sender = resolveField(message, "sender", index);
+  if (sender) return participantUrn(sender);
+  const direct = message.sender ?? message["*sender"];
+  return typeof direct === "string" && /^urn:li:fsd_profile:/.test(direct) ? direct : null;
+}
+
+function participantProfile(value: Json, index: Map<string, Json>): string | null {
+  const member = object(object(value.participantType)?.member) ??
+    object(object(value["com.linkedin.voyager.messaging.MessagingMember"])?.miniProfile);
+  const host = typeof value.hostIdentityUrn === "string" ? index.get(value.hostIdentityUrn) : undefined;
+  const publicId = member?.publicIdentifier ?? host?.publicIdentifier;
+  const url = member?.profileUrl ?? member?.publicProfileUrl ?? member?.navigationUrl ??
+    (typeof publicId === "string" ? `https://www.linkedin.com/in/${publicId}` : "");
+  return normalizedProfileUrl(String(url));
 }
 
 function timestamp(value: string): number {
@@ -105,10 +135,11 @@ async function graphql(page: Page, queryId: string, variables: Json): Promise<Js
 
 async function mailboxUrn(page: Page): Promise<string> {
   const raw = await voyager(page, "/me");
-  const included = includedIndex(raw);
-  const candidates = [...included.values()].map((row) => String(row.dashEntityUrn ?? row.entityUrn ?? ""));
-  const urn = candidates.find((value) => /^urn:li:fsd_profile:[A-Za-z0-9_-]+$/.test(value)) ??
-    candidates.find((value) => /^urn:li:fs_miniProfile:[A-Za-z0-9_-]+$/.test(value))?.replace("fs_miniProfile", "fsd_profile");
+  const ref = object(raw.data)?.["*miniProfile"];
+  const mini = typeof ref === "string" ? includedIndex(raw).get(ref) : undefined;
+  const candidate = String(mini?.dashEntityUrn ?? mini?.entityUrn ?? "");
+  const urn = /^urn:li:fsd_profile:[A-Za-z0-9_-]+$/.test(candidate) ? candidate :
+    /^urn:li:fs_miniProfile:[A-Za-z0-9_-]+$/.test(candidate) ? candidate.replace("fs_miniProfile", "fsd_profile") : null;
   if (!urn) throw new IncompleteLinkedInInboxError("Own LinkedIn mailbox identity missing");
   return urn;
 }
@@ -130,7 +161,7 @@ async function scanInbox(page: Page): Promise<Inbound[]> {
       mailboxUrn: self,
       ...(cursor ? { nextCursor: cursor } : {}),
     });
-    const { rows, metadata } = collection(raw, "messengerConversationsByCategoryQuery");
+    const { rows, metadata, index } = collection(raw, "messengerConversationsByCategoryQuery");
     if (rows.length === 0 && metadata.nextCursor) throw new IncompleteLinkedInInboxError("Empty LinkedIn inbox page has continuation");
     for (const thread of rows) {
       const urn = String(thread.entityUrn ?? "");
@@ -138,7 +169,7 @@ async function scanInbox(page: Page): Promise<Inbound[]> {
         throw new IncompleteLinkedInInboxError("LinkedIn conversation identity missing or repeated");
       }
       seenThreads.add(urn);
-      const participants = Array.isArray(thread.conversationParticipants) ? thread.conversationParticipants.map(object) : null;
+      const participants = resolveList(thread, "conversationParticipants", index) ?? resolveList(thread, "participants", index);
       if (!participants || participants.some((p) => !p)) {
         throw new IncompleteLinkedInInboxError("LinkedIn conversation participants missing");
       }
@@ -148,12 +179,15 @@ async function scanInbox(page: Page): Promise<Inbound[]> {
       if (!other || participants.filter((p) => participantUrn(p!) === self).length !== 1) {
         throw new IncompleteLinkedInInboxError("LinkedIn conversation mailbox participant mismatch");
       }
-      const profileUrl = participantProfile(other);
+      const profileUrl = participantProfile(other, index);
       if (!profileUrl) throw new IncompleteLinkedInInboxError("LinkedIn participant exact profile URL missing");
       events.push(...await scanMessages(page, urn, self, participantUrn(other)!, profileUrl));
     }
     const next = metadata.nextCursor;
-    if (next === null || next === undefined || next === "") return events;
+    if (next === null || next === undefined || next === "") {
+      if (rows.length >= PAGE_SIZE) throw new IncompleteLinkedInInboxError("Full LinkedIn inbox page has no end cursor");
+      return events;
+    }
     if (typeof next !== "string" || seenCursors.has(next)) throw new IncompleteLinkedInInboxError("LinkedIn inbox cursor invalid or repeated");
     seenCursors.add(next);
     cursor = next;
@@ -172,13 +206,13 @@ async function scanMessages(page: Page, urn: string, self: string, other: string
       countBefore: PAGE_SIZE,
       countAfter: 0,
     });
-    const { rows } = collection(raw, "messengerMessagesByConversation");
+    const { rows, index } = collection(raw, "messengerMessagesByConversation");
     if (!rows.length) return events;
     let oldest = Infinity;
     for (const message of rows) {
       const id = String(message.entityUrn ?? "");
       const deliveredAt = message.deliveredAt;
-      const sender = participantUrn(object(message.sender) ?? {});
+      const sender = messageSenderUrn(message, index);
       if (!/^urn:li:msg_message:\(.+\)$/.test(id) || seen.has(id) ||
           typeof deliveredAt !== "number" || !Number.isFinite(deliveredAt) ||
           (sender !== self && sender !== other)) {
@@ -208,19 +242,23 @@ export async function outboundMessageIds(page: Page, profileUrl: string, text: s
       mailboxUrn: self,
       ...(cursor ? { nextCursor: cursor } : {}),
     });
-    const { rows, metadata } = collection(raw, "messengerConversationsByCategoryQuery");
+    const { rows, metadata, index } = collection(raw, "messengerConversationsByCategoryQuery");
     for (const thread of rows) {
-      const participants = Array.isArray(thread.conversationParticipants) ? thread.conversationParticipants.map(object) : null;
+      const participants = resolveList(thread, "conversationParticipants", index) ?? resolveList(thread, "participants", index);
       if (!participants || participants.length !== 2 || participants.some((p) => !p)) continue;
       const other = participants.find((p) => participantUrn(p!) !== self);
-      if (!other || participantProfile(other) !== profileUrl) continue;
+      if (!other || participants.filter((p) => participantUrn(p!) === self).length !== 1 ||
+          participantProfile(other, index) !== profileUrl) continue;
       if (conversationUrn) throw new IncompleteLinkedInInboxError("Multiple conversations for recipient identity");
       const urn = String(thread.entityUrn ?? "");
       if (!/^urn:li:msg_conversation:\(.+\)$/.test(urn)) throw new IncompleteLinkedInInboxError("Conversation identity missing");
       conversationUrn = urn;
     }
     const next = metadata.nextCursor;
-    if (next === null || next === undefined || next === "") break;
+    if (next === null || next === undefined || next === "") {
+      if (rows.length >= PAGE_SIZE) throw new IncompleteLinkedInInboxError("Full LinkedIn inbox page has no end cursor");
+      break;
+    }
     if (typeof next !== "string" || seenCursors.has(next)) throw new IncompleteLinkedInInboxError("Inbox cursor invalid or repeated");
     seenCursors.add(next);
     cursor = next;
@@ -230,10 +268,10 @@ export async function outboundMessageIds(page: Page, profileUrl: string, text: s
   const raw = await graphql(page, MESSAGES_QUERY, {
     deliveredAt: Date.now(), conversationUrn, countBefore: 20, countAfter: 0,
   });
-  const { rows } = collection(raw, "messengerMessagesByConversation");
+  const { rows, index } = collection(raw, "messengerMessagesByConversation");
   const result = new Set<string>();
   for (const message of rows) {
-    const sender = participantUrn(object(message.sender) ?? {});
+    const sender = messageSenderUrn(message, index);
     if (sender !== self) continue;
     if (object(message.body)?.text !== text) continue;
     const id = String(message.entityUrn ?? "");
@@ -261,7 +299,7 @@ export async function syncLinkedInInbox(db: Database.Database, accountId: string
     const events = await scanInbox(page);
     const rows = db.prepare(`SELECT DISTINCT t.id, t.linkedin_url,
         (SELECT MIN(a.dispatched_at) FROM dispatch_actions a
-         WHERE a.sender_id = ? AND a.target_id = t.id AND a.channel = 'message'
+         WHERE a.sender_id = ? AND a.target_id = t.id AND a.channel IN ('message','connect')
            AND a.state IN ('sending','confirmed','unknown')) AS first_sent_at
       FROM targets t JOIN run_profiles rp ON rp.target_id = t.id
       JOIN runs r ON r.id = rp.run_id

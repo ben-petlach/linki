@@ -58,7 +58,7 @@ async function browserFixture(incomplete = false) {
     }
     requests.push(url.toString());
     if (url.pathname === "/voyager/api/me") {
-      await route.fulfill({ json: { data: {}, included: [{ entityUrn: `urn:li:fs_miniProfile:ACoAAASELF`, dashEntityUrn: self }] } });
+      await route.fulfill({ json: { data: { "*miniProfile": "urn:li:fs_miniProfile:ACoAAASELF" }, included: [{ entityUrn: "urn:li:fs_miniProfile:ACoAAASELF", dashEntityUrn: self }] } });
     } else if (url.searchParams.get("queryId")?.startsWith("messengerConversations")) {
       const cursor = url.searchParams.get("variables")?.includes("nextCursor:page-2");
       const thread = { entityUrn: conversation,
@@ -96,5 +96,18 @@ test("unknown pagination shape invalidates inbox freshness and records no reply"
     await assert.rejects(syncLinkedInInbox(db, "ben", page), IncompleteLinkedInInboxError);
     assert.equal((db.prepare("SELECT last_replied_at FROM targets WHERE id = 'alex'").get() as {last_replied_at:string|null}).last_replied_at, null);
     assert.equal(getInboxFreshness(db, { accountId: "ben", channel: "linkedin", maxAgeMs: 60000 }).fresh, false);
+  } finally { await browser.close(); db.close(); }
+});
+
+test("reply after invitation alone blocks the first message", async () => {
+  const db = database();
+  db.prepare("DELETE FROM dispatch_actions WHERE action_key = 'send-1'").run();
+  db.prepare(`INSERT INTO dispatch_actions
+    (action_key, state, token, dispatched_at, sender_id, target_id, channel, payload, evidence)
+    VALUES ('invite-1', 'confirmed', 'tok', '2026-10-17 12:00:00', 'ben', 'alex', 'connect', NULL, 'pending:alex')`).run();
+  const { browser, page } = await browserFixture();
+  try {
+    assert.equal(await syncLinkedInInbox(db, "ben", page), 1);
+    assert.equal(evaluateEligibility(db, "alex").allowed, false);
   } finally { await browser.close(); db.close(); }
 });
