@@ -162,6 +162,9 @@ export function initLegacyOutreachReview(db: Database.Database): number {
       AND (rpt.current_step > 0 OR rpt.last_step_at IS NOT NULL
         OR rpt.state IN ('in_progress', 'completed'))
   )` : "";
+  const trackSelect = hasTracks ? `,
+    (SELECT id FROM run_profile_tracks WHERE run_profile_id = rp.id ORDER BY id LIMIT 1) AS trackId`
+    : ", NULL AS trackId";
   const runProfileColumns = db.prepare("PRAGMA table_info(run_profiles)").all() as Array<{ name: string }>;
   const legacyStepCriterion = runProfileColumns.some((column) => column.name === "current_step")
     ? "OR rp.current_step > 0 OR rp.last_step_at IS NOT NULL" : "";
@@ -171,6 +174,7 @@ export function initLegacyOutreachReview(db: Database.Database): number {
       WHERE name = 'legacy_outreach_review_v1'`).get()) return 0;
     const participants = db.prepare(`
       SELECT r.id AS runId, r.status, rp.id AS profileId, rp.target_id AS targetId
+        ${trackSelect}
       FROM runs r JOIN run_profiles rp ON rp.run_id = r.id
       JOIN targets t ON t.id = rp.target_id
       WHERE r.status IN ('running', 'paused') AND (
@@ -181,7 +185,7 @@ export function initLegacyOutreachReview(db: Database.Database): number {
           AND l.target_id = rp.target_id AND l.message LIKE 'Email sent%')
         ${legacyStepCriterion} ${trackCriterion}
       )
-    `).all() as Array<{ runId: string; status: string; profileId: string; targetId: string }>;
+    `).all() as Array<{ runId: string; status: string; profileId: string; targetId: string; trackId: string | null }>;
     const pause = db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?");
     const review = db.prepare(`INSERT INTO legacy_outreach_review
       (run_id, prior_status, reason) VALUES (?, ?, ?)`);
@@ -190,7 +194,8 @@ export function initLegacyOutreachReview(db: Database.Database): number {
     const reviewedRuns = new Set<string>();
     for (const participant of participants) {
       suppressTarget(db, participant.targetId, "legacy_outreach_review",
-        `run:${participant.runId};profile:${participant.profileId}`);
+        `run:${participant.runId};profile:${participant.profileId}` +
+          (participant.trackId ? `;track:${participant.trackId}` : ""));
       if (reviewedRuns.has(participant.runId)) continue;
       reviewedRuns.add(participant.runId);
       pause.run(participant.runId);
