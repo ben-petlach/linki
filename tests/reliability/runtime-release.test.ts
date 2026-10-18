@@ -17,6 +17,11 @@ test("startup rejects missing and placeholder credentials without echoing values
   assert.match(invalid.join(" "), /AUTH_PASSWORD/);
   assert.match(invalid.join(" "), /NEXTAUTH_URL/);
   assert.doesNotMatch(invalid.join(" "), /changeme|test-password/);
+  for (const value of ["your_password_here", "<paste-unique-password>", "your_random_secret_here", "<paste-generated-value>"]) {
+    const errors = validateProductionRuntime({ NODE_ENV: "production", NEXTAUTH_SECRET: value, AUTH_PASSWORD: value, NEXTAUTH_URL: "http://localhost:3456" });
+    assert.match(errors.join(" "), /NEXTAUTH_SECRET/);
+    assert.match(errors.join(" "), /AUTH_PASSWORD/);
+  }
   assert.deepEqual(validateProductionRuntime({
     NODE_ENV: "production",
     NEXTAUTH_SECRET: "a-long-random-looking-runtime-secret-12345",

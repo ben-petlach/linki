@@ -1,6 +1,6 @@
 import path from "node:path";
 
-const placeholder = /^(?:changeme|replace(?:-?me)?|your[_ -]?(?:password|secret|value)|example(?:[_ -].*)?|synthetic-ci-secret-never-use-in-production|test(?:[_ -]?(?:password|secret))?)$/i;
+const placeholder = /^(?:<[^>]+>|changeme|replace(?:[-_ ]?me)?|your[_ -].+|example(?:[_ -].*)?|synthetic(?:[_ -].*)?|test[-_ ]?(?:password|secret))$/i;
 
 export function validateProductionRuntime(env: NodeJS.ProcessEnv = process.env): string[] {
   const errors: string[] = [];

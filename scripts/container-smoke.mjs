@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { randomBytes } from "node:crypto";
 import { chromium } from "playwright";
 
 const require = createRequire(import.meta.url);
@@ -16,13 +17,13 @@ assert.ok(expectedCommit && expectedDigest, "Expected commit and image digest ar
 const temporary = mkdtempSync(path.join(tmpdir(), "linki-container-smoke-"));
 const port = 31459;
 const url = `http://127.0.0.1:${port}`;
-const internalSecret = "synthetic-container-smoke-internal-secret-123456789";
+const internalSecret = randomBytes(48).toString("base64url");
 const env = {
   ...process.env,
   NODE_ENV: "production",
   NEXTAUTH_URL: url,
-  NEXTAUTH_SECRET: "synthetic-container-smoke-secret-123456789",
-  AUTH_PASSWORD: "synthetic-container-smoke-password-123456789",
+  NEXTAUTH_SECRET: randomBytes(48).toString("base64url"),
+  AUTH_PASSWORD: randomBytes(32).toString("base64url"),
   INTERNAL_API_SECRET: internalSecret,
   LINKI_DB_PATH: path.join(temporary, "linki.db"),
   LINKI_DISABLE_BACKGROUND: "1",
