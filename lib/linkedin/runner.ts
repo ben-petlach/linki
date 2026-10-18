@@ -280,7 +280,7 @@ export async function dispatchStep<T>(
   db: ReturnType<typeof getDb>, tr: TrackRun, step: WorkflowStep, target: Target,
   senderId: string, channel: SendChannel, limit: number, schedule: ScheduleConfig,
   payload: string, recipientIdentity: string,
-  send: (beforeSend: () => void) => Promise<T>, evidence: (result: T) => string
+  send: (beforeSend: () => void, finalEligibility: () => void) => Promise<T>, evidence: (result: T) => string
 ): Promise<"sent" | "confirmed" | "held" | "deferred"> {
   const key = actionKey(tr.id, step.id);
   const senderTable = channel === "email" ? "email_accounts" : "accounts";
@@ -294,8 +294,7 @@ export async function dispatchStep<T>(
     return "held";
   }
   const token = claim.token;
-  const beforeSend = () => {
-    const started = beginDispatch(db, key, token, () => {
+  const gate = () => {
       const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(tr.run_id) as { status: string } | undefined;
       if (run?.status !== "running") return "run paused";
       if (!isWithinSchedule(schedule)) return "outside sender schedule";
@@ -352,8 +351,8 @@ export async function dispatchStep<T>(
       }
       if (channel === "message" && !isConnectedForAccount(db, senderId, target.id)) return "sender has no verified connection";
       const used = (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
-        WHERE sender_id = ? AND channel = ? AND state IN ('sending','confirmed','unknown')
-        AND date(dispatched_at) = date('now')`).get(senderId, channel) as { count: number }).count;
+        WHERE sender_id = ? AND channel = ? AND action_key <> ? AND state IN ('sending','confirmed','unknown')
+        AND date(dispatched_at) = date('now')`).get(senderId, channel, key) as { count: number }).count;
       const legacyMessage = channel === "connect" ? "Connection request sent%" :
         channel === "message" ? "Message sent%" : channel === "sales_inmail" ? "InMail sent%" : "Email sent%";
       const legacy = channel === "email"
@@ -366,11 +365,19 @@ export async function dispatchStep<T>(
       // outcomes reserve capacity for that day. Overlap double counts safely.
       if (used + legacy >= limit) return "daily limit reached";
       return null;
-    });
+  };
+  const beforeSend = () => {
+    const started = beginDispatch(db, key, token, gate);
     if (!started.started) throw new DispatchBlockedError(started.reason ?? "dispatch gate blocked");
   };
+  const finalEligibility = () => {
+    const action = getAction(db, key);
+    if (action?.state !== "sending" || action.token !== token) throw new DispatchBlockedError("dispatch ownership changed");
+    const reason = db.transaction(gate).immediate();
+    if (reason) throw new DispatchBlockedError(reason);
+  };
   try {
-    const result = await send(beforeSend);
+    const result = await send(beforeSend, finalEligibility);
     if (getAction(db, key)?.state !== "sending") throw new Error("adapter returned without crossing dispatch gate");
     const proof = evidence(result);
     if (!proof || !confirmAction(db, key, token, proof)) throw new Error("provider acceptance not confirmed");
@@ -710,9 +717,9 @@ async function executeStep(
       log(db, runId, target.id, "info", `Sending connection request to ${name}`);
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
       const dispatched = await dispatchStep(db, tr, step, target, accountId, "connect", accountLimits.daily_connection_limit, accountLimits, linkedinUrl, linkedinUrl,
-        async beforeSend => {
+        async (beforeSend, finalEligibility) => {
           const page = await getSessionPage(accountId);
-          try { return await sendConnectionRequest(page, linkedinUrl, beforeSend); } finally { await page.close(); }
+          try { return await sendConnectionRequest(page, linkedinUrl, beforeSend, finalEligibility); } finally { await page.close(); }
         }, result => result.evidence);
       if (dispatched !== "sent" && dispatched !== "confirmed") return;
       await saveSessionState(accountId);
