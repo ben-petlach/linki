@@ -7,7 +7,9 @@ export class PendingInviteError extends Error {}
 /** An invitation click may have reached LinkedIn. Hold for review. */
 export class UnconfirmedConnectionError extends Error {}
 
-export async function sendConnectionRequest(page: Page, linkedinUrl: string, beforeSend?: () => void): Promise<{ evidence: string }> {
+export async function sendConnectionRequest(
+  page: Page, linkedinUrl: string, beforeSend?: () => void, finalEligibility?: () => void
+): Promise<{ evidence: string }> {
   const identity = normalizedProfileUrl(linkedinUrl);
   if (!identity) throw new LinkedInLayoutError("Target has no exact LinkedIn profile URL");
   await page.goto(identity, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -23,6 +25,7 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
 
   const direct = topCard.locator('a[aria-label*="Invite"][aria-label*="to connect"], a[href*="custom-invite"]');
   if (await direct.count() === 1) {
+    beforeSend?.(); // This first click may send immediately on some layouts.
     await direct.click();
   } else {
     const more = topCard.locator('button[aria-label="More"]');
@@ -30,13 +33,16 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     await more.click();
     const connect = page.locator('[role="menuitem"]:has-text("Connect"):visible');
     if (await connect.count() !== 1) throw new LinkedInLayoutError("Connect menu item missing or ambiguous");
+    beforeSend?.(); // A menu item is not guaranteed to open a confirmation dialog.
     await connect.click();
   }
 
-  const send = page.locator('button:has-text("Send now"), button[aria-label*="Send without"], button[aria-label*="Send invitation"]:not([aria-label*="note"])');
-  if (await send.count() !== 1) throw new LinkedInLayoutError("Invitation confirmation control missing or ambiguous");
-  beforeSend?.();
-  await send.click();
+  const send = page.locator('button:has-text("Send now"):visible, button[aria-label*="Send without"]:visible, button[aria-label*="Send invitation"]:not([aria-label*="note"]):visible');
+  if (await send.count() > 1) throw new UnconfirmedConnectionError("Invitation confirmation control ambiguous after first click");
+  if (await send.count() === 1) {
+    finalEligibility?.();
+    await send.click();
+  }
   const limitPopup = page.locator('div[class*="ip-fuse-limit-alert__warning"]');
   if (await limitPopup.count()) throw new WeeklyLimitError("Weekly connection limit reached");
   const errorToast = page.locator('div[data-test-artdeco-toast-item-type="error"]:visible');
