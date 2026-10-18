@@ -19,6 +19,8 @@ services:
       LINKI_IMAGE_DIGEST: ${LINKI_IMAGE_DIGEST:-unavailable}
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
     deploy:
       resources:

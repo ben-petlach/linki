@@ -1,5 +1,6 @@
-# Digest pins the Node runtime. Rebuild and scan regularly for OS updates.
-FROM node:22-trixie-slim@sha256:154ba2f4d6fec323d28e4f4bb86bba4677f1223391a1979cf521304e03a98dfa
+# Bookworm's GBM does not require the LLVM/libxml2 stack. Keep OS security
+# updates and the same Playwright browser; do not mix Debian release packages.
+FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
 
 WORKDIR /app
 
