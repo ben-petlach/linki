@@ -32,6 +32,6 @@ jobs:
       - name: Repeat crash and concurrency acceptance
         run: |
           for attempt in 1 2 3; do
-            node --import ./tests/setup.mjs --import tsx --test tests/reliability/dispatch.test.ts tests/reliability/suppression-routes.test.ts tests/integration/core-reliability.test.ts
+            node --import ./tests/setup.mjs --import tsx --test tests/reliability/dispatch.test.ts tests/reliability/suppression-routes.test.ts tests/integration/*.test.ts
           done
       - run: npm run build

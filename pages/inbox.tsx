@@ -166,7 +166,7 @@ function ReplyModal({ reply, onClose, onActionDone, hasPremium }: ReplyModalProp
 
   async function handleSend() {
     if (sending || !replyText.trim() || !reply.email || !reply.email_account_id) return;
-    const payload = JSON.stringify([reply.id, reply.email_account_id, reply.email, replySubject, replyText]);
+    const payload = JSON.stringify([reply.id, reply.reply_id, reply.email_account_id, reply.email, replySubject, replyText]);
     if (sendAttempt.current?.payload !== payload) {
       sendAttempt.current = { payload, key: crypto.randomUUID() };
     }
