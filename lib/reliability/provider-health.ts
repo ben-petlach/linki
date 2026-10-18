@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { resolveTxt } from "node:dns/promises";
 import type Database from "better-sqlite3";
-import { initSuppressionSchema, suppressIdentity } from "@/lib/reliability/suppression";
+import { initSuppressionSchema, normalizeSuppressionValue, suppressIdentity } from "@/lib/reliability/suppression";
 
 type Db = Database.Database;
 type Channel = "email" | "linkedin";
@@ -66,6 +66,7 @@ export function recordTrustedProviderComplaint(db: Db, input: {
     db.prepare(`INSERT OR IGNORE INTO provider_sender_holds
       (sender_id, channel, reason, evidence, held_at) VALUES (?, 'email', 'provider_complaint', ?, ?)`)
       .run(input.emailAccountId, input.providerEventId, input.receivedAt);
+    suppressIdentity(db, { kind: "email", value: input.recipient, reason: "provider_complaint", evidence: input.providerEventId });
   })();
 }
 
@@ -116,14 +117,25 @@ export function consumeUnsubscribeToken(db: Db, token: string): "suppressed" | "
   let parsed: { v?: unknown; actionKey?: unknown };
   try { parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")); } catch { return "invalid"; }
   if (parsed.v !== 1 || typeof parsed.actionKey !== "string" || parsed.actionKey.length > 512) return "invalid";
-  const outbound = db.prepare(`SELECT recipient_email FROM email_outbound WHERE action_key = ?`).get(parsed.actionKey) as { recipient_email: string } | undefined;
+  const outbound = db.prepare(`SELECT target_id, recipient_email FROM email_outbound WHERE action_key = ?`)
+    .get(parsed.actionKey) as { target_id: string; recipient_email: string } | undefined;
   if (!outbound) return "invalid";
   initSuppressionSchema(db);
   const existing = db.prepare(`SELECT 1 FROM suppression_rules WHERE kind = 'email' AND value = ? AND reason = 'unsubscribe_link'`)
     .get(outbound.recipient_email);
-  if (existing) return "already_suppressed";
-  suppressIdentity(db, { kind: "email", value: outbound.recipient_email, reason: "unsubscribe_link", evidence: `outbound:${parsed.actionKey}` });
-  return "suppressed";
+  db.transaction(() => {
+    const evidence = `outbound:${parsed.actionKey}`;
+    suppressIdentity(db, { kind: "email", value: outbound.recipient_email, reason: "unsubscribe_link", evidence });
+    const target = db.prepare("SELECT email, linkedin_url FROM targets WHERE id = ?")
+      .get(outbound.target_id) as { email: string | null; linkedin_url: string | null } | undefined;
+    if (!target) return;
+    suppressIdentity(db, { kind: "target", value: outbound.target_id, reason: "unsubscribe_link", evidence });
+    if (target.email && normalizeSuppressionValue("email", target.email))
+      suppressIdentity(db, { kind: "email", value: target.email, reason: "unsubscribe_link", evidence });
+    if (target.linkedin_url && normalizeSuppressionValue("linkedin", target.linkedin_url))
+      suppressIdentity(db, { kind: "linkedin", value: target.linkedin_url, reason: "unsubscribe_link", evidence });
+  }).immediate();
+  return existing ? "already_suppressed" : "suppressed";
 }
 
 export async function checkEmailDnsReadiness(fromEmail: string, resolver: TxtResolver = resolveTxt, dkimSelector?: string): Promise<{

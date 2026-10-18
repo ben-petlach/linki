@@ -104,9 +104,14 @@ function headerIds(mail: ParsedMail): string[] {
 }
 
 /** Returns true only when a durable state change was made. */
-export async function processInboundEmail(db: Db, emailAccountId: string, raw: Buffer | string, authenticatedImapScan = false): Promise<"reply" | "unsubscribe" | "bounce" | "ambiguous" | "ignored" | "duplicate"> {
-  initEmailReliabilitySchema(db);
+export async function processInboundEmail(db: Db, emailAccountId: string, raw: Buffer | string,
+  authenticatedImapScan = false, stillOwnsLease?: () => boolean): Promise<"reply" | "unsubscribe" | "bounce" | "ambiguous" | "ignored" | "duplicate"> {
+  db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
+    initEmailReliabilitySchema(db);
+  }).immediate();
   const mail = await simpleParser(raw);
+  if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
   const messageId = normalizedMessageId(mail.messageId) || `sha256:${createHash("sha256").update(raw).digest("hex")}`;
   const duplicate = db.prepare("SELECT 1 FROM email_inbound WHERE email_account_id = ? AND message_id = ?")
     .get(emailAccountId, messageId);
@@ -137,28 +142,32 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
   if (isDsn) {
     if (!finalRecipient || finalRecipient !== matched.recipient_email) return "ignored";
     db.transaction(() => {
+      if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
       db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, 'bounce', ?)")
         .run(emailAccountId, messageId, matched!.target_id, receivedAt);
       db.prepare("UPDATE targets SET email_status = 'invalid' WHERE id = ?").run(matched!.target_id);
       suppressIdentity(db, { kind: "email", value: finalRecipient, reason: "hard_bounce", evidence: messageId });
-      if (authenticatedImapScan) recordSenderBounce(db, { emailAccountId, recipient: finalRecipient, messageId, receivedAt });
+      if (authenticatedImapScan) recordSenderBounce(db, { emailAccountId, recipient: finalRecipient, messageId,
+        receivedAt: new Date().toISOString() });
       db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Email bounced — invalid address'
         WHERE run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?) AND track = 'email' AND state IN ('pending', 'in_progress')`)
         .run(matched!.target_id);
-    })();
+    }).immediate();
     return "bounce";
   }
   if (from !== matched.recipient_email) return "ignored";
   if (!threaded && !unsubscribed) {
     db.transaction(() => {
+      if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
       db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, 'ambiguous', ?)")
         .run(emailAccountId, messageId, matched!.target_id, receivedAt);
       suppressTarget(db, matched!.target_id, "ambiguous_inbound", messageId);
-    })();
+    }).immediate();
     return "ambiguous";
   }
   const kind = unsubscribed ? "unsubscribe" : "reply";
   db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
     db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, ?, ?)")
       .run(emailAccountId, messageId, matched!.target_id, kind, receivedAt);
     db.prepare(`INSERT INTO email_replies (id, target_id, run_id, email_account_id, message_id, from_email, subject, body_text, received_at)
@@ -174,7 +183,7 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
     db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Lead replied'
       WHERE run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?) AND state IN ('pending', 'in_progress')`)
       .run(matched!.target_id);
-  })();
+  }).immediate();
   return kind;
 }
 
@@ -212,14 +221,20 @@ function withTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
   ]).finally(() => clearTimeout(timer!));
 }
 
-export async function syncEmailInbox(emailAccountId: string, db: Db = getDb()): Promise<{ replies: number; bounces: number }> {
+export async function syncEmailInbox(emailAccountId: string, db: Db = getDb(), stillOwnsLease?: () => boolean): Promise<{ replies: number; bounces: number }> {
   const startedAt = new Date().toISOString();
-  initEmailReliabilitySchema(db);
-  initInboxStateSchema(db);
+  db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
+    initEmailReliabilitySchema(db);
+    initInboxStateSchema(db);
+  }).immediate();
   const account = db.prepare(`SELECT id, imap_host, imap_port, username, password, imap_username, imap_password
     FROM email_accounts WHERE id = ?`).get(emailAccountId) as EmailAccount | undefined;
   if (!account?.imap_host) {
-    recordInboxSyncFailure(db, { accountId: emailAccountId, channel: "email", error: "IMAP not configured", startedAt });
+    db.transaction(() => {
+      if (stillOwnsLease && !stillOwnsLease()) return;
+      recordInboxSyncFailure(db, { accountId: emailAccountId, channel: "email", error: "IMAP not configured", startedAt });
+    }).immediate();
     throw new Error("IMAP not configured");
   }
   const earliest = db.prepare(`SELECT MIN(COALESCE(accepted_at, created_at)) AS at FROM email_outbound WHERE email_account_id = ?`)
@@ -244,16 +259,22 @@ export async function syncEmailInbox(emailAccountId: string, db: Db = getDb()): 
     const uids = await withTimeout(search(imap, [["SINCE", since]]), "IMAP search");
     for (const uid of uids) {
       if (connectionError) throw connectionError;
-      const kind = await processInboundEmail(db, emailAccountId, await withTimeout(readMessage(imap, uid), "IMAP fetch"), true);
+      const kind = await processInboundEmail(db, emailAccountId, await withTimeout(readMessage(imap, uid), "IMAP fetch"), true, stillOwnsLease);
       if (kind === "reply" || kind === "unsubscribe") replies++;
       if (kind === "bounce") bounces++;
     }
     if (connectionError) throw connectionError;
-    recordInboxSyncSuccess(db, { accountId: emailAccountId, channel: "email", startedAt });
-    db.prepare("UPDATE email_accounts SET inbox_synced_at = datetime('now') WHERE id = ?").run(emailAccountId);
+    db.transaction(() => {
+      if (stillOwnsLease && !stillOwnsLease()) throw new Error("Inbox lease lost");
+      recordInboxSyncSuccess(db, { accountId: emailAccountId, channel: "email", startedAt });
+      db.prepare("UPDATE email_accounts SET inbox_synced_at = datetime('now') WHERE id = ?").run(emailAccountId);
+    }).immediate();
     return { replies, bounces };
   } catch (err) {
-    recordInboxSyncFailure(db, { accountId: emailAccountId, channel: "email", error: err instanceof Error ? err.message : String(err), startedAt });
+    db.transaction(() => {
+      if (stillOwnsLease && !stillOwnsLease()) return;
+      recordInboxSyncFailure(db, { accountId: emailAccountId, channel: "email", error: err instanceof Error ? err.message : String(err), startedAt });
+    }).immediate();
     throw err;
   } finally {
     try { imap.end(); } catch { /* connection may have failed before setup */ }

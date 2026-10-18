@@ -22,7 +22,7 @@ export async function sendDirectEmail(db: Database.Database, input: {
   initActionSchema(db);
   const initial = gate(db, input.targetId, input.account.id, input.recipient, key, false, input.replyId, input.inReplyTo);
   if (initial) return { ok: false, status: 409, error: initial };
-  const claim = claimAction(db, { key, senderId: input.account.id, targetId: input.targetId, channel: "email" });
+  const claim = claimAction(db, { key, senderId: input.account.id, targetId: input.targetId, channel: "email", recipientIdentity: input.recipient });
   if (!claim.claimed) return { ok: false, status: 409, error: `Action already ${claim.state}: ${claim.reason}` };
   const token = claim.token;
   let started = false;

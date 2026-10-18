@@ -8,6 +8,10 @@ import {
 } from "../../lib/reliability/provider-health";
 import { evaluateEligibility, initSuppressionSchema } from "../../lib/reliability/suppression";
 import { safeConnectionError } from "../../pages/api/email-accounts/[id]/readiness";
+import sendTestHandler from "../../pages/api/email-accounts/[id]/send-test";
+import { getDb } from "../../lib/db";
+import { setGlobalDispatchPause } from "../../lib/reliability/operations";
+import type { NextApiRequest, NextApiResponse } from "next";
 
 function fixture() {
   const db = new Database(":memory:");
@@ -40,6 +44,20 @@ test("signed one-click token rejects tampering, and repeated opt-out durably blo
     db.prepare("DELETE FROM targets WHERE id = 'person'").run();
     db.prepare("INSERT INTO targets VALUES ('reimport', 'person@example.com', NULL, 'company')").run();
     assert.equal(evaluateEligibility(db, "reimport", { channel: "email" }).allowed, false);
+  } finally { db.close(); }
+});
+
+test("opt-out follows original outbound recipient and current target after email changes", () => {
+  const db = fixture();
+  try {
+    db.prepare("UPDATE targets SET email = 'new@example.com' WHERE id = 'person'").run();
+    assert.equal(consumeUnsubscribeToken(db, createUnsubscribeToken("action:one")), "suppressed");
+    assert.equal(evaluateEligibility(db, "person", { channel: "linkedin" }).allowed, false);
+    db.prepare("DELETE FROM targets WHERE id = 'person'").run();
+    db.prepare("INSERT INTO targets VALUES ('original-reimport', 'person@example.com', NULL, 'company')").run();
+    db.prepare("INSERT INTO targets VALUES ('linkedin-reimport', 'other@example.com', 'https://www.linkedin.com/in/person', 'company')").run();
+    assert.equal(evaluateEligibility(db, "original-reimport", { channel: "email" }).allowed, false);
+    assert.equal(evaluateEligibility(db, "linkedin-reimport", { channel: "linkedin" }).allowed, false);
   } finally { db.close(); }
 });
 
@@ -108,4 +126,24 @@ test("readiness diagnostics redact provider messages that echo credentials", () 
     assert.equal(safe.includes(secret), false);
     assert.equal(safe.includes(username), false);
   }
+});
+
+test("diagnostic self-send respects global pause before SMTP", async () => {
+  const db = getDb();
+  db.prepare(`INSERT INTO email_accounts (id, name, from_email, smtp_host, smtp_port, username, password)
+    VALUES ('provider-test-sender', 'Synthetic sender', 'sender@example.test', '127.0.0.1', 1, 'sender', 'synthetic-password')`).run();
+  setGlobalDispatchPause(db, { paused: true, actorId: "test-operator", reason: "synthetic pause" });
+  let statusCode = 0;
+  let body: unknown;
+  const res = {
+    status(code: number) { statusCode = code; return this; },
+    json(value: unknown) { body = value; return this; },
+    setHeader() { return this; },
+    end() { return this; },
+  } as unknown as NextApiResponse;
+  const req = { method: "POST", query: { id: "provider-test-sender" },
+    body: { to: "sender@example.test", subject: "Test", body: "Synthetic" } } as unknown as NextApiRequest;
+  await sendTestHandler(req, res);
+  assert.equal(statusCode, 409);
+  assert.match(JSON.stringify(body), /Global dispatch paused/);
 });
