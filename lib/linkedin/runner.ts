@@ -298,7 +298,7 @@ export async function dispatchStep<T>(
       if (track?.state !== "in_progress" || track.current_step !== tr.current_step) return "step changed";
       const reply = db.prepare("SELECT last_replied_at, email_replied_at FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null } | undefined;
       if (reply?.last_replied_at || reply?.email_replied_at) return "lead replied";
-      const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin" });
+      const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin", checkNetNewRules: true });
       if (!suppression.allowed) return `suppressed: ${suppression.blocks.map(b => b.reason).join(", ")}`;
       const inbox = getInboxFreshness(db, {
         accountId: senderId, channel: channel === "email" ? "email" : "linkedin",
