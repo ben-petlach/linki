@@ -5,9 +5,9 @@ import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { syncLinkedInInbox } from "@/lib/linkedin/inbox";
-import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
+import { syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { sendEmail } from "@/lib/email/sender";
-import { shouldSyncEmailInbox, syncEmailInbox, MAX_EMAIL_INBOX_AGE_MS } from "@/lib/email/inbox";
+import { syncEmailInbox, MAX_EMAIL_INBOX_AGE_MS } from "@/lib/email/inbox";
 import { registerOutboundEmail, markOutboundAccepted } from "@/lib/email/inbox";
 import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
@@ -16,6 +16,9 @@ import { decryptSecret } from "@/lib/crypto";
 import { actionKey, beginDispatch, claimAction, confirmAction, getAction, holdUnknown, releaseClaim } from "@/lib/reliability/actions";
 import { isConnectedForAccount, recordConnectedEvidence, recordConnectionRequested, getConnectionRequestedAt, recordMessagingIdentity, getMessagingIdentity, clearConnectedEvidence } from "@/lib/reliability/relationships";
 import { getInboxFreshness, recordInboxSyncFailure } from "@/lib/reliability/inbox-state";
+import { claimPoll, completePoll } from "@/lib/reliability/scheduler";
+import { evaluateOperationAlerts, getDispatchBlockReason, recordWorkerHeartbeat } from "@/lib/reliability/operations";
+import { getProviderDispatchBlockReason } from "@/lib/reliability/provider-health";
 import { evaluateEligibility } from "@/lib/reliability/suppression";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
@@ -83,46 +86,44 @@ function getLocalParts(tz: string, date = new Date()): { hour: number; minute: n
   return { hour, minute, isoWeekday: weekdayMap[get("weekday")] ?? 1 };
 }
 
-function isWithinSchedule(account: ScheduleConfig): boolean {
-  const { hour, minute, isoWeekday } = getLocalParts(account.timezone || "UTC");
+export function isWithinScheduleAt(account: ScheduleConfig, at = new Date()): boolean {
+  try { new Intl.DateTimeFormat("en-US", { timeZone: account.timezone || "UTC" }); }
+  catch { return false; }
+  const { hour, minute, isoWeekday } = getLocalParts(account.timezone || "UTC", at);
   const allowedDays = (account.working_days || "1,2,3,4,5").split(",").map(Number);
   if (!allowedDays.includes(isoWeekday)) return false;
   const frac = hour + minute / 60;
   return frac >= (account.active_hours_start ?? 9) && frac < (account.active_hours_end ?? 18);
 }
 
-function randomSlotInActiveWindow(account: ScheduleConfig, targetDate?: Date): string {
+function isWithinSchedule(account: ScheduleConfig): boolean { return isWithinScheduleAt(account); }
+
+export function nextScheduledSlotAt(account: ScheduleConfig, from: Date, tomorrow = false): string {
+  try { new Intl.DateTimeFormat("en-US", { timeZone: account.timezone || "UTC" }); }
+  catch { throw new Error("Invalid sending timezone"); }
+  const allowedDays = new Set((account.working_days || "1,2,3,4,5").split(",").map(Number));
   const start = account.active_hours_start ?? 9;
   const end = account.active_hours_end ?? 18;
-  const base = targetDate ? new Date(targetDate) : new Date();
-  const startMs = new Date(base.getFullYear(), base.getMonth(), base.getDate(), start, 0, 0).getTime();
-  const endMs   = new Date(base.getFullYear(), base.getMonth(), base.getDate(), end,   0, 0).getTime();
-  return new Date(startMs + Math.random() * (endMs - startMs)).toISOString();
+  if (end <= start || allowedDays.size === 0) throw new Error("Invalid sending schedule");
+  const sourceDay = new Intl.DateTimeFormat("en-CA", { timeZone: account.timezone || "UTC", year: "numeric", month: "2-digit", day: "2-digit" }).format(from);
+  const dateFormat = new Intl.DateTimeFormat("en-CA", { timeZone: account.timezone || "UTC", year: "numeric", month: "2-digit", day: "2-digit" });
+  const startTime = Math.ceil((from.getTime() + 60_000) / (15 * 60_000)) * (15 * 60_000);
+  for (let offset = 0; offset < 15 * 24 * 4; offset++) {
+    const candidate = new Date(startTime + offset * 15 * 60_000);
+    if (tomorrow && dateFormat.format(candidate) === sourceDay) continue;
+    const local = getLocalParts(account.timezone || "UTC", candidate);
+    const hour = local.hour + local.minute / 60;
+    if (allowedDays.has(local.isoWeekday) && hour >= start && hour < end) return candidate.toISOString();
+  }
+  throw new Error("No sending slot in next 15 days");
 }
 
 function rescheduleToTomorrow(account: ScheduleConfig): string {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return randomSlotInActiveWindow(account, tomorrow);
+  return nextScheduledSlotAt(account, new Date(), true);
 }
 
 function nextScheduledSlot(account: ScheduleConfig): string {
-  const tz = account.timezone || "UTC";
-  const allowedDays = (account.working_days || "1,2,3,4,5").split(",").map(Number);
-  const end = account.active_hours_end ?? 18;
-  const { hour: nowHour, minute: nowMin, isoWeekday: nowDay } = getLocalParts(tz);
-  const nowFrac = nowHour + nowMin / 60;
-  if (allowedDays.includes(nowDay) && nowFrac < end - 0.25) {
-    const remaining = (end - nowFrac) * 3600_000;
-    return new Date(Date.now() + Math.random() * remaining).toISOString();
-  }
-  const candidate = new Date();
-  for (let i = 1; i <= 14; i++) {
-    candidate.setDate(candidate.getDate() + 1);
-    const { isoWeekday } = getLocalParts(tz, candidate);
-    if (allowedDays.includes(isoWeekday)) return randomSlotInActiveWindow(account, candidate);
-  }
-  return new Date(Date.now() + 86_400_000).toISOString();
+  return nextScheduledSlotAt(account, new Date());
 }
 
 interface WorkflowStep {
@@ -295,6 +296,10 @@ export async function dispatchStep<T>(
   }
   const token = claim.token;
   const gate = () => {
+      const globalBlock = getDispatchBlockReason(db);
+      if (globalBlock) return globalBlock;
+      const providerBlock = getProviderDispatchBlockReason(db, senderId, channel === "email" ? "email" : "linkedin");
+      if (providerBlock) return providerBlock;
       const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(tr.run_id) as { status: string } | undefined;
       if (run?.status !== "running") return "run paused";
       if (!isWithinSchedule(schedule)) return "outside sender schedule";
@@ -976,7 +981,8 @@ async function executeStep(
             recipient: freshTarget.email!, messageId, subject: emailSubject,
           });
           beforeSend();
-          const result = await sendEmail({ ...emailAccount, password: decryptSecret(emailAccount.password)! }, freshTarget.email!, emailSubject, finalEmailBody, { messageId });
+          const result = await sendEmail({ ...emailAccount, password: decryptSecret(emailAccount.password)! }, freshTarget.email!, emailSubject, finalEmailBody,
+            { messageId, unsubscribeActionKey: actionKey(tr.id, step.id) });
           if (result.accepted.map(address => address.toLowerCase()).includes(freshTarget.email!.toLowerCase())) {
             markOutboundAccepted(db, actionKey(tr.id, step.id));
           }
@@ -1050,10 +1056,14 @@ async function globalLoop(): Promise<void> {
 
   while (true) {
     try {
+      recordWorkerHeartbeat(db);
       await tick(db);
+      recordWorkerHeartbeat(db);
     } catch (err) {
       console.error("[runner] Tick error:", err instanceof Error ? err.message : err);
     }
+    try { evaluateOperationAlerts(db); }
+    catch (err) { console.error("[runner] Alerts error:", err instanceof Error ? err.message : err); }
     try {
       const { processScheduledImports } = await import("@/lib/import-jobs");
       await processScheduledImports(db);
@@ -1064,124 +1074,113 @@ async function globalLoop(): Promise<void> {
   }
 }
 
-async function tick(db: ReturnType<typeof getDb>): Promise<void> {
+export interface RunnerDependencies {
+  now?: () => Date;
+  syncLinkedInInbox?: (db: ReturnType<typeof getDb>, accountId: string) => Promise<number>;
+  syncEmailInbox?: (accountId: string, db: ReturnType<typeof getDb>) => Promise<{ replies: number; bounces: number }>;
+  syncAcceptedConnections?: (accountId: string) => Promise<number>;
+  executeStep?: typeof executeStep;
+  sleep?: (ms: number) => Promise<void>;
+  pollTimeoutMs?: number;
+}
+
+function dispatchedToday(db: ReturnType<typeof getDb>, senderId: string, channel: SendChannel): number {
+  return (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
+    WHERE sender_id = ? AND channel = ? AND state IN ('sending','confirmed','unknown')
+      AND date(dispatched_at) = date('now')`).get(senderId, channel) as { count: number }).count;
+}
+
+async function pollInboxes(db: ReturnType<typeof getDb>, deps: RunnerDependencies): Promise<void> {
+  const now = deps.now ?? (() => new Date());
+  const linkedinAccounts = db.prepare("SELECT id FROM accounts WHERE is_authenticated = 1 ORDER BY id").all() as { id: string }[];
+  const emailAccounts = db.prepare("SELECT id FROM email_accounts WHERE imap_host IS NOT NULL ORDER BY id").all() as { id: string }[];
+  const linkedinSync = deps.syncLinkedInInbox ?? (async (database, accountId) => {
+    const page = await getSessionPage(accountId);
+    try { return await syncLinkedInInbox(database, accountId, page); }
+    finally { await page.close(); }
+  });
+  const emailSync = deps.syncEmailInbox ?? syncEmailInbox;
+  const acceptedSync = deps.syncAcceptedConnections ?? syncAcceptedConnections;
+  const polls: Array<Promise<void>> = [];
+  let linkedinStarted = 0;
+  let acceptedStarted = 0;
+  let emailStarted = 0;
+
+  for (const { id } of linkedinAccounts) {
+    const startedAt = now().toISOString();
+    const token = linkedinStarted < 4 ? claimPoll(db, "linkedin", id, new Date(startedAt)) : null;
+    if (token) polls.push((async () => {
+      try {
+        await linkedinSync(db, id);
+        completePoll(db, "linkedin", id, token, {}, now());
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        recordInboxSyncFailure(db, { accountId: id, channel: "linkedin", error: reason, startedAt });
+        completePoll(db, "linkedin", id, token, { error: reason }, now());
+        console.warn(`[runner] LinkedIn inbox ${id}: ${reason}`);
+      }
+    })());
+    if (token) linkedinStarted++;
+    const connectionsToken = acceptedStarted < 2 ? claimPoll(db, "connections", id, now()) : null;
+    if (connectionsToken) polls.push((async () => {
+      try {
+        await acceptedSync(id);
+        completePoll(db, "connections", id, connectionsToken, {}, now());
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        completePoll(db, "connections", id, connectionsToken, { error: reason }, now());
+        console.warn(`[runner] Accepted connections ${id}: ${reason}`);
+      }
+    })());
+    if (connectionsToken) acceptedStarted++;
+  }
+  for (const { id } of emailAccounts) {
+    if (emailStarted >= 4) break;
+    const startedAt = now().toISOString();
+    const token = claimPoll(db, "email", id, new Date(startedAt));
+    if (token) polls.push((async () => {
+      try {
+        await emailSync(id, db);
+        completePoll(db, "email", id, token, {}, now());
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        recordInboxSyncFailure(db, { accountId: id, channel: "email", error: reason, startedAt });
+        completePoll(db, "email", id, token, { error: reason }, now());
+        console.warn(`[runner] Email inbox ${id}: ${reason}`);
+      }
+    })());
+    if (token) emailStarted++;
+  }
+  await Promise.allSettled(polls.map(async poll => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([poll, new Promise<void>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Inbox poll timed out; lease retained until worker completes")),
+          deps.pollTimeoutMs ?? 90_000);
+      })]);
+    } catch (error) {
+      console.warn("[runner]", error instanceof Error ? error.message : error);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }));
+}
+
+export async function tick(db: ReturnType<typeof getDb>, deps: RunnerDependencies = {}): Promise<void> {
+  recordWorkerHeartbeat(db, "scheduler", (deps.now?.() ?? new Date()).toISOString());
+  await pollInboxes(db, deps);
   const activeRuns = db.prepare(`
     SELECT r.id as run_id, r.workflow_id, r.account_id, r.email_account_id,
            a.daily_connection_limit, a.daily_message_limit, a.daily_inmail_limit,
            a.active_hours_start, a.active_hours_end, a.timezone, a.working_days
     FROM runs r
     JOIN accounts a ON a.id = r.account_id
-    WHERE r.status = 'running' AND a.is_authenticated = 1
+    WHERE r.status = 'running'
   `).all() as Array<{ run_id: string; workflow_id: string; account_id: string; email_account_id: string | null } & AccountLimits>;
 
   if (activeRuns.length === 0) return;
 
   console.log(`[runner] Tick — ${activeRuns.length} active run(s)`);
-
-  const seenAccounts = new Set<string>();
-  for (const run of activeRuns) {
-    if (seenAccounts.has(run.account_id)) continue;
-    seenAccounts.add(run.account_id);
-  }
-
-  const activeRunIds = activeRuns.map(r => r.run_id);
-  const activeReplyInboxes = db.prepare(`
-    WITH active_targets AS (
-      SELECT DISTINCT target_id FROM run_profiles WHERE run_id IN (${activeRunIds.map(() => "?").join(",")})
-    )
-    SELECT DISTINCT rt.track AS channel,
-      CASE rt.track WHEN 'linkedin' THEN r.account_id ELSE rp.email_account_id END AS sender_id
-    FROM run_profile_tracks rt
-    JOIN run_profiles rp ON rp.id = rt.run_profile_id
-    JOIN runs r ON r.id = rp.run_id
-    JOIN active_targets a ON a.target_id = rp.target_id
-    WHERE rt.state IN ('pending','in_progress')
-      OR EXISTS (SELECT 1 FROM logs l WHERE l.run_id = rp.run_id AND l.target_id = rp.target_id
-        AND ((rt.track = 'email' AND l.message LIKE 'Email sent%')
-          OR (rt.track = 'linkedin' AND (
-            l.message LIKE 'Connection request sent%' OR l.message LIKE 'Message sent%' OR l.message LIKE 'InMail sent%'))))
-    UNION
-    SELECT DISTINCT CASE WHEN da.channel = 'email' THEN 'email' ELSE 'linkedin' END AS channel,
-      da.sender_id AS sender_id
-    FROM dispatch_actions da
-    JOIN active_targets a ON a.target_id = da.target_id
-    WHERE da.channel IN ('email','linkedin','connect','message','sales_inmail')
-      AND da.state IN ('sending','confirmed','unknown')
-  `).all(...activeRunIds) as Array<{ channel: "linkedin" | "email"; sender_id: string | null }>;
-  const linkedinInboxAccounts = new Set(seenAccounts);
-  for (const inbox of activeReplyInboxes) {
-    if (inbox.channel === "linkedin" && inbox.sender_id) linkedinInboxAccounts.add(inbox.sender_id);
-  }
-
-  // Daily sync: stamp accepted connections from invitation manager (once per 23h per account)
-  for (const accountId of seenAccounts) {
-    if (shouldSyncAccepted(accountId)) {
-      try {
-        console.log(`[runner] Starting accepted-connections sync for account ${accountId}`);
-        const stamped = await syncAcceptedConnections(accountId);
-        if (stamped > 0) {
-          for (const r of activeRuns.filter(x => x.account_id === accountId)) {
-            log(db, r.run_id, null, "info", `Accepted-connections sync: ${stamped} contact${stamped === 1 ? "" : "s"} marked as connected`);
-          }
-        }
-        console.log(`[runner] Accepted-connections sync complete — ${stamped} stamped`);
-      } catch (e) {
-        console.warn("[runner] Accepted-connections sync error:", e instanceof Error ? e.message : e);
-      }
-    }
-  }
-
-  // Complete public inbox sync provides reply evidence and freshness before sends.
-  for (const accountId of linkedinInboxAccounts) {
-    const freshness = getInboxFreshness(db, { accountId, channel: "linkedin", maxAgeMs: 15 * 60_000 });
-    // A failed session/checkpoint should not be hit every 30-second tick.
-    const failedRecently = freshness.lastFailureAt && Date.now() - Date.parse(freshness.lastFailureAt) < 15 * 60_000;
-    if (!freshness.fresh && !failedRecently) {
-      try {
-        console.log(`[runner] Starting LinkedIn inbox sync for account ${accountId}`);
-        const page = await getSessionPage(accountId);
-        let replies: number;
-        try { replies = await syncLinkedInInbox(db, accountId, page); }
-        finally { await page.close(); }
-        console.log(`[runner] LinkedIn inbox sync complete — ${replies} new repl${replies === 1 ? "y" : "ies"}`);
-        if (replies > 0) {
-          for (const r of activeRuns.filter(x => x.account_id === accountId)) {
-            log(db, r.run_id, null, "info", `LinkedIn inbox sync: ${replies} new repl${replies === 1 ? "y" : "ies"} detected`);
-          }
-        }
-      } catch (e) {
-        recordInboxSyncFailure(db, { accountId, channel: "linkedin", error: e instanceof Error ? e.message : String(e) });
-        console.warn("[runner] LinkedIn inbox sync error:", e instanceof Error ? e.message : e);
-      }
-    }
-  }
-
-  // Sync email IMAP inboxes for each unique email account in active run profiles
-  const activeEmailAccountIds = [...new Set(activeReplyInboxes
-    .filter(inbox => inbox.channel === "email" && inbox.sender_id)
-    .map(inbox => inbox.sender_id!))];
-
-  const seenEmailAccounts = new Set<string>();
-  for (const emailAccId of activeEmailAccountIds) {
-    if (seenEmailAccounts.has(emailAccId)) continue;
-    seenEmailAccounts.add(emailAccId);
-    if (shouldSyncEmailInbox(emailAccId)) {
-      try {
-        console.log(`[runner] Starting IMAP sync for email account ${emailAccId}`);
-        const { replies, bounces } = await syncEmailInbox(emailAccId);
-        console.log(`[runner] IMAP sync complete — ${replies} replies, ${bounces} bounces`);
-        for (const runId of activeRunIds) {
-          if (replies > 0) log(db, runId, null, "info", `Email inbox sync: ${replies} new repl${replies === 1 ? "y" : "ies"} detected`);
-          if (bounces > 0) log(db, runId, null, "warn", `Email inbox sync: ${bounces} bounce${bounces === 1 ? "" : "s"} detected — contacts marked invalid and unenrolled`);
-        }
-      } catch (e) {
-        console.warn("[runner] Email inbox sync error:", e instanceof Error ? e.message : e);
-      }
-      // Space out back-to-back IMAP syncs — a 20-account burst with zero gap
-      // between them held the host busy for minutes straight (Jul 2026 incident).
-      await sleep(2000);
-    }
-  }
 
   // Auto-complete runs where ALL track-runs across all profiles are terminal
   for (const run of activeRuns) {
@@ -1207,6 +1206,8 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
   `).all() as Array<{ run_id: string; workflow_id: string; account_id: string; email_account_id: string | null } & AccountLimits>;
 
   if (stillActive.length === 0) return;
+
+  if (getDispatchBlockReason(db)) return;
 
   const accountLimitsMap = new Map<string, AccountLimits>();
   for (const run of stillActive) {
@@ -1253,9 +1254,11 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
       `SELECT COUNT(*) as c FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
        AND message LIKE 'Visited %' AND date(created_at) = date('now')`
     ).get(accountId) as { c: number }).c;
-    connectsSentToday.set(accountId, c);
-    messagesSentToday.set(accountId, m);
-    inmailsSentToday.set(accountId, im);
+    // Legacy logs can overlap durable actions; conservative double counting
+    // reduces throughput rather than allowing an over-limit send after a crash.
+    connectsSentToday.set(accountId, c + dispatchedToday(db, accountId, "connect"));
+    messagesSentToday.set(accountId, m + dispatchedToday(db, accountId, "message"));
+    inmailsSentToday.set(accountId, im + dispatchedToday(db, accountId, "sales_inmail"));
     visitsSentToday.set(accountId, v);
   }
 
@@ -1273,7 +1276,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
          AND rp.email_account_id = ?
        )`
     ).get(emailAccountId) as { c: number }).c;
-    emailsSentToday.set(emailAccountId, e);
+    emailsSentToday.set(emailAccountId, e + dispatchedToday(db, emailAccountId, "email"));
   }
 
   // Steps cache: (workflow_id, track) → steps filtered by that track
@@ -1376,7 +1379,9 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
          WHERE rp.run_id = ? AND rt.track = 'linkedin' AND rt.state = 'pending'
          ORDER BY rt.id LIMIT ?`
       ).all(run.run_id, toEnroll) as Array<{ id: string; run_profile_id: string; track: string }>;
-      spreadEnrollBatch(db, run.run_id, pending, limits, "linkedin");
+      if ((db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(run.account_id) as { is_authenticated: number } | undefined)?.is_authenticated === 1) {
+        spreadEnrollBatch(db, run.run_id, pending, limits, "linkedin");
+      }
       slotsRemaining.set(run.account_id, slotsLeft - pending.length);
     }
 
@@ -1434,6 +1439,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
     if (stepIndex >= steps.length) { toExecute.push(tr); continue; }
     const step = steps[stepIndex];
     const limits = accountLimitsMap.get(tr.account_id)!;
+    if (tr.track === "linkedin" && !(db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(tr.account_id) as { is_authenticated: number } | undefined)?.is_authenticated) continue;
 
     if (step.step_type === "connect") {
       // A connect step is "due" both when it's about to send a NEW request and when
@@ -1525,8 +1531,9 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
     if (!runStatus || runStatus.status !== "running") continue;
 
     const target = db.prepare("SELECT * FROM targets WHERE id = ?").get(tr.target_id) as Target;
-    await executeStep(db, tr.run_id, tr, target, steps, tr.account_id, limits, emailAccountId, emailLimits, getWorkflowPrompt(tr.workflow_id));
-    await randomDelay(PROFILE_DELAY_MIN, PROFILE_DELAY_MAX);
+    await (deps.executeStep ?? executeStep)(db, tr.run_id, tr, target, steps, tr.account_id, limits, emailAccountId, emailLimits, getWorkflowPrompt(tr.workflow_id));
+    if (deps.sleep) await deps.sleep(0);
+    else await randomDelay(PROFILE_DELAY_MIN, PROFILE_DELAY_MAX);
   }
 }
 
@@ -1539,26 +1546,13 @@ function spreadEnrollBatch(
 ) {
   const batchSize = pending.length;
   if (batchSize === 0) return;
-  const start = limits.active_hours_start ?? 9;
-  const end = limits.active_hours_end ?? 18;
-  const { hour, minute } = getLocalParts(limits.timezone || "UTC");
-  const nowFrac = hour + minute / 60;
-  const windowMs = (end - start) * 3600_000;
-  const bucketMs = windowMs / batchSize;
-  const dayStartMs = new Date().setHours(start, 0, 0, 0);
-
   for (let i = 0; i < pending.length; i++) {
     const row = pending[i];
     const claimed = db.prepare(
       "UPDATE run_profile_tracks SET state = 'in_progress' WHERE id = ? AND state = 'pending'"
     ).run(row.id);
     if (claimed.changes === 0) continue;
-    const slot = (() => {
-      if (nowFrac >= end - 0.25) return rescheduleToTomorrow(limits);
-      const bucketStart = dayStartMs + i * bucketMs;
-      const bucketEnd = bucketStart + bucketMs;
-      return new Date(bucketStart + Math.random() * (bucketEnd - bucketStart)).toISOString();
-    })();
+    const slot = nextScheduledSlotAt(limits, new Date(Date.now() + i * 30 * 60_000));
     db.prepare("UPDATE run_profile_tracks SET next_step_at = ? WHERE id = ?").run(slot, row.id);
     const tgt = db.prepare("SELECT full_name, linkedin_url FROM targets WHERE id = (SELECT target_id FROM run_profiles WHERE id = ?)").get(row.run_profile_id) as { full_name: string | null; linkedin_url: string } | undefined;
     log(db, runId, null, "info", `[${track}] Scheduled ${tgt?.full_name ?? tgt?.linkedin_url ?? row.run_profile_id} within active window`);
