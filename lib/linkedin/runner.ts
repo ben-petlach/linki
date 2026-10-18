@@ -265,11 +265,13 @@ type SendChannel = "connect" | "message" | "sales_inmail" | "email";
 
 // Every external send crosses this boundary. The action becomes irrevocable before
 // the provider call: a crash or timeout after that point holds the step for review.
-async function dispatchStep<T>(
+class DispatchBlockedError extends Error {}
+
+export async function dispatchStep<T>(
   db: ReturnType<typeof getDb>, tr: TrackRun, step: WorkflowStep, target: Target,
   senderId: string, channel: SendChannel, limit: number, schedule: ScheduleConfig,
   payload: string,
-  send: () => Promise<T>, evidence: (result: T) => string
+  send: (beforeSend: () => void) => Promise<T>, evidence: (result: T) => string
 ): Promise<"sent" | "confirmed" | "held" | "deferred"> {
   const key = actionKey(tr.id, step.id);
   const claim = claimAction(db, { key, senderId, targetId: target.id, channel, payload });
@@ -280,58 +282,65 @@ async function dispatchStep<T>(
     return "held";
   }
   const token = claim.token;
-  const started = beginDispatch(db, key, token, () => {
-    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(tr.run_id) as { status: string } | undefined;
-    if (run?.status !== "running") return "run paused";
-    if (!isWithinSchedule(schedule)) return "outside sender schedule";
-    if (channel === "email") {
-      const sender = db.prepare("SELECT is_verified FROM email_accounts WHERE id = ?").get(senderId) as { is_verified: number } | undefined;
-      if (!sender?.is_verified) return "email sender not verified";
-    } else {
-      const sender = db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(senderId) as { is_authenticated: number } | undefined;
-      if (!sender?.is_authenticated) return "LinkedIn sender not authenticated";
-    }
-    const track = db.prepare("SELECT state, current_step FROM run_profile_tracks WHERE id = ?").get(tr.id) as { state: string; current_step: number } | undefined;
-    if (track?.state !== "in_progress" || track.current_step !== tr.current_step) return "step changed";
-    const reply = db.prepare("SELECT last_replied_at, email_replied_at FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null } | undefined;
-    if (reply?.last_replied_at || reply?.email_replied_at) return "lead replied";
-    const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin" });
-    if (!suppression.allowed) return `suppressed: ${suppression.blocks.map(b => b.reason).join(", ")}`;
-    const inbox = getInboxFreshness(db, {
-      accountId: senderId, channel: channel === "email" ? "email" : "linkedin",
-      maxAgeMs: channel === "email" ? 3 * 60 * 60_000 : 30 * 60_000,
+  const beforeSend = () => {
+    const started = beginDispatch(db, key, token, () => {
+      const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(tr.run_id) as { status: string } | undefined;
+      if (run?.status !== "running") return "run paused";
+      if (!isWithinSchedule(schedule)) return "outside sender schedule";
+      if (channel === "email") {
+        const sender = db.prepare("SELECT is_verified FROM email_accounts WHERE id = ?").get(senderId) as { is_verified: number } | undefined;
+        if (!sender?.is_verified) return "email sender not verified";
+      } else {
+        const sender = db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(senderId) as { is_authenticated: number } | undefined;
+        if (!sender?.is_authenticated) return "LinkedIn sender not authenticated";
+      }
+      const track = db.prepare("SELECT state, current_step FROM run_profile_tracks WHERE id = ?").get(tr.id) as { state: string; current_step: number } | undefined;
+      if (track?.state !== "in_progress" || track.current_step !== tr.current_step) return "step changed";
+      const reply = db.prepare("SELECT last_replied_at, email_replied_at FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null } | undefined;
+      if (reply?.last_replied_at || reply?.email_replied_at) return "lead replied";
+      const suppression = evaluateEligibility(db, target.id, { channel: channel === "email" ? "email" : "linkedin" });
+      if (!suppression.allowed) return `suppressed: ${suppression.blocks.map(b => b.reason).join(", ")}`;
+      const inbox = getInboxFreshness(db, {
+        accountId: senderId, channel: channel === "email" ? "email" : "linkedin",
+        maxAgeMs: channel === "email" ? 3 * 60 * 60_000 : 30 * 60_000,
+      });
+      if (!inbox.fresh) return `inbox ${inbox.reason}`;
+      if (channel === "message" && !isConnectedForAccount(db, senderId, target.id)) return "sender has no verified connection";
+      const used = (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
+        WHERE sender_id = ? AND channel = ? AND state IN ('sending','confirmed','unknown')
+        AND date(created_at) = date('now')`).get(senderId, channel) as { count: number }).count;
+      const legacyMessage = channel === "connect" ? "Connection request sent%" :
+        channel === "message" ? "Message sent%" : channel === "sales_inmail" ? "InMail sent%" : "Email sent%";
+      const legacy = channel === "email"
+        ? (db.prepare(`SELECT COUNT(*) AS count FROM logs l WHERE l.message LIKE ? AND date(l.created_at) = date('now')
+            AND EXISTS (SELECT 1 FROM run_profiles rp WHERE rp.run_id = l.run_id AND rp.target_id = l.target_id AND rp.email_account_id = ?)`)
+            .get(legacyMessage, senderId) as { count: number }).count
+        : (db.prepare(`SELECT COUNT(*) AS count FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
+            AND message LIKE ? AND date(created_at) = date('now')`).get(senderId, legacyMessage) as { count: number }).count;
+      // Legacy logs and action rows can overlap. Double counting is conservative;
+      // it may defer a send, but cannot push an account past its cap.
+      if (used + legacy >= limit) return "daily limit reached";
+      return null;
     });
-    if (!inbox.fresh) return `inbox ${inbox.reason}`;
-    if (channel === "message" && !isConnectedForAccount(db, senderId, target.id)) return "sender has no verified connection";
-    const used = (db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions
-      WHERE sender_id = ? AND channel = ? AND state IN ('sending','confirmed','unknown')
-      AND date(created_at) = date('now')`).get(senderId, channel) as { count: number }).count;
-    const legacyMessage = channel === "connect" ? "Connection request sent%" :
-      channel === "message" ? "Message sent%" : channel === "sales_inmail" ? "InMail sent%" : "Email sent%";
-    const legacy = channel === "email"
-      ? (db.prepare(`SELECT COUNT(*) AS count FROM logs l WHERE l.message LIKE ? AND date(l.created_at) = date('now')
-          AND EXISTS (SELECT 1 FROM run_profiles rp WHERE rp.run_id = l.run_id AND rp.target_id = l.target_id AND rp.email_account_id = ?)`)
-          .get(legacyMessage, senderId) as { count: number }).count
-      : (db.prepare(`SELECT COUNT(*) AS count FROM logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
-          AND message LIKE ? AND date(created_at) = date('now')`).get(senderId, legacyMessage) as { count: number }).count;
-    // Legacy logs and action rows can overlap. Double counting is conservative;
-    // it may defer a send, but cannot push an account past its cap.
-    const count = used + legacy;
-    if (count >= limit) return "daily limit reached";
-    return null;
-  });
-  if (!started.started) {
-    releaseClaim(db, key, token);
-    db.prepare("UPDATE run_profile_tracks SET error_message = ? WHERE id = ?").run(started.reason, tr.id);
-    return "deferred";
-  }
+    if (!started.started) throw new DispatchBlockedError(started.reason ?? "dispatch gate blocked");
+  };
   try {
-    const result = await send();
+    const result = await send(beforeSend);
+    if (getAction(db, key)?.state !== "sending") throw new Error("adapter returned without crossing dispatch gate");
     const proof = evidence(result);
     if (!proof || !confirmAction(db, key, token, proof)) throw new Error("provider acceptance not confirmed");
     return "sent";
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (getAction(db, key)?.state === "claimed") {
+      releaseClaim(db, key, token);
+      if (error instanceof DispatchBlockedError) {
+        db.prepare("UPDATE run_profile_tracks SET error_message = ? WHERE id = ?").run(reason, tr.id);
+        trWait(db, tr, 0.25);
+        return "deferred";
+      }
+      throw error;
+    }
     holdUnknown(db, key, token, reason);
     trFail(db, tr, `Action ${key} outcome unknown; review required: ${reason}`);
     return "held";
@@ -628,9 +637,9 @@ async function executeStep(
       log(db, runId, target.id, "info", `Sending connection request to ${name}`);
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
       const dispatched = await dispatchStep(db, tr, step, target, accountId, "connect", accountLimits.daily_connection_limit, accountLimits, linkedinUrl,
-        async () => {
+        async beforeSend => {
           const page = await getSessionPage(accountId);
-          try { return await sendConnectionRequest(page, linkedinUrl); } finally { await page.close(); }
+          try { return await sendConnectionRequest(page, linkedinUrl, beforeSend); } finally { await page.close(); }
         }, result => result.evidence);
       if (dispatched !== "sent" && dispatched !== "confirmed") return;
       await saveSessionState(accountId);
@@ -721,11 +730,11 @@ async function executeStep(
       log(db, runId, target.id, "info", `Sending message to ${name}`);
       const messageLinkedinUrl = await getLinkedinUrl(db, target, accountId);
       const dispatched = await dispatchStep(db, tr, step, target, accountId, "message", accountLimits.daily_message_limit, accountLimits, messageText,
-        async () => {
+        async beforeSend => {
           const page = await getSessionPage(accountId);
           try {
             if (!target.full_name) throw new Error(`Target ${target.id} has no full_name — cannot search messaging`);
-            const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, getMessagingIdentity(db, accountId, target.id));
+            const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, getMessagingIdentity(db, accountId, target.id), beforeSend);
             if (result.messagingUrn) recordMessagingIdentity(db, { accountId, targetId: target.id, messagingUrn: result.messagingUrn });
             return result;
           } finally { await page.close(); }
@@ -738,109 +747,11 @@ async function executeStep(
       log(db, runId, target.id, "info", `Message sent to ${name}`);
 
     } else if (step.step_type === "sales_inmail") {
-      // Sales Navigator InMail — reaches NON-connections (no degree gate), needs a
-      // subject + body, costs one InMail credit. Body config mirrors the message
-      // step (AI writer OR templates OR raw body); subject comes from email_subject.
-      if (!premium?.inmail) {
-        log(db, runId, target.id, "warn", `Sales Nav InMail is a premium feature — not available in this build. Skipping ${name}`);
-        trAdvance(db, tr, steps);
-        return;
-      }
-      await ensureSalesNavEnriched(db, target, accountId);
-      if (!enforceSchedule(db, tr, runId, target.id, name, accountLimits)) return;
-
-      const freshTarget = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
-      if (!freshTarget.sales_nav_url) {
-        log(db, runId, target.id, "warn", `${name} has no Sales Nav URL — cannot send InMail, skipping`);
-        trSkip(db, tr, "No Sales Nav URL for InMail");
-        return;
-      }
-
-      let inmailBody = "";
-      let inmailSubject = "";
-      if (step.ai_enabled) {
-        if (!premium?.ai) {
-          log(db, runId, target.id, "warn", `AI writer is a premium feature — not available in this build. Skipping ${name}`);
-          trAdvance(db, tr, steps);
-          return;
-        }
-        const integration = db.prepare("SELECT api_key FROM integrations WHERE key = 'openrouter'").get() as { api_key: string } | undefined;
-        const agentCfgForMsg = premium.ai.getAgentConfig();
-        const resolvedMsgModel = step.ai_model || agentCfgForMsg.default_model;
-        if (!integration?.api_key || !resolvedMsgModel) {
-          log(db, runId, target.id, "warn", `AI enabled on InMail step but OpenRouter key or model missing — skipping ${name}`);
-          trAdvance(db, tr, steps);
-          return;
-        }
-        const contactData = premium.ai.getContactWithCompany(target.id);
-        if (!contactData) {
-          log(db, runId, target.id, "warn", `Could not load contact data for AI InMail — skipping ${name}`);
-          trAdvance(db, tr, steps);
-          return;
-        }
-        log(db, runId, target.id, "info", `Generating AI InMail for ${name} with ${resolvedMsgModel}`);
-        const msgPosition = step.message_position ?? 1;
-        let previousMessageContext: { followupNumber: number; previousMessage: string } | undefined;
-        if (msgPosition > 1 && tr.last_linkedin_message) {
-          previousMessageContext = { followupNumber: msgPosition - 1, previousMessage: tr.last_linkedin_message };
-        }
-        const result = await premium.ai.writeSalesInMail({
-          apiKey: decryptSecret(integration.api_key)!,
-          model: resolvedMsgModel,
-          stepType: "sales_inmail",
-          stepPrompt: step.ai_prompt ?? "",
-          maxWords: step.ai_max_words ?? undefined,
-          language: step.ai_language ?? undefined,
-          campaignPrompt: campaignPrompt ?? undefined,
-          contact: contactData.contact,
-          company: contactData.company,
-          agentConfig: agentCfgForMsg,
-          previousMessageContext,
-          runId,
-          targetId: target.id,
-          stepId: step.id,
-        });
-        inmailBody = result.body;
-        inmailSubject = result.subject;
-      } else {
-        const multiTemplateIds = (db.prepare("SELECT template_id FROM workflow_step_templates WHERE step_id = ?").all(step.id) as Array<{ template_id: string }>).map(r => r.template_id);
-        if (multiTemplateIds.length > 0) {
-          const randomId = multiTemplateIds[Math.floor(Math.random() * multiTemplateIds.length)];
-          const tmpl = db.prepare("SELECT * FROM templates WHERE id = ?").get(randomId) as Template | undefined;
-          if (tmpl) inmailBody = renderTemplate(tmpl.body, freshTarget);
-        } else if (step.template_id) {
-          const tmpl = db.prepare("SELECT * FROM templates WHERE id = ?").get(step.template_id) as Template | undefined;
-          if (tmpl) inmailBody = renderTemplate(tmpl.body, freshTarget);
-        }
-        if (!inmailBody && step.message_body) inmailBody = renderTemplate(step.message_body, freshTarget);
-        inmailSubject = renderTemplate(step.email_subject ?? "", freshTarget).trim();
-      }
-      if (!inmailBody) {
-        log(db, runId, target.id, "warn", `No body for InMail step — skipping ${name}`);
-        trAdvance(db, tr, steps);
-        return;
-      }
-      if (!inmailSubject) {
-        log(db, runId, target.id, "warn", `No subject for InMail step (required) — skipping ${name}`);
-        trAdvance(db, tr, steps);
-        return;
-      }
-
-      db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
-      log(db, runId, target.id, "info", `Sending InMail to ${name}`);
-      const dispatched = await dispatchStep(db, tr, step, target, accountId, "sales_inmail", accountLimits.daily_inmail_limit, accountLimits, inmailBody,
-        async () => {
-          const page = await getSessionPage(accountId);
-          try { await premium.inmail.sendInMail(page, freshTarget.sales_nav_url, inmailSubject, inmailBody); }
-          finally { await page.close(); }
-          return "";
-        }, result => result);
-      if (dispatched !== "sent" && dispatched !== "confirmed") return;
-      await saveSessionState(accountId);
-      db.prepare("UPDATE targets SET inmail_sent_at = ?, message_sent_at = COALESCE(message_sent_at, ?) WHERE id = ?").run(nowIso(), nowIso(), target.id);
-      trRecordContext(db, tr, { linkedinMessage: inmailBody });
-      trAdvance(db, tr, steps);
-      log(db, runId, target.id, "info", `InMail sent to ${name}`);
+      // The public adapter cannot provide recipient-bound outbound evidence.
+      // Block before opening a page or consuming a credit.
+      trFail(db, tr, "InMail sending unavailable: adapter cannot confirm recipient-bound outbound evidence");
+      log(db, runId, target.id, "warn", `InMail blocked for ${name}: no verified outbound evidence`);
+      return;
 
     } else if (step.step_type === "email") {
       await ensureApolloEnriched(db, target, runId);
@@ -979,11 +890,12 @@ async function executeStep(
       log(db, runId, target.id, "info", `Sending email to ${name} <${freshTarget.email}>`);
       const messageId = `<${randomUUID()}@${emailAccount.from_email.split("@")[1]}>`;
       const dispatched = await dispatchStep(db, tr, step, target, emailAccountId, "email", hardLimit, emailAccountLimits, JSON.stringify({ emailSubject, emailBody }),
-        async () => {
+        async beforeSend => {
           registerOutboundEmail(db, {
             actionKey: actionKey(tr.id, step.id), targetId: target.id, emailAccountId,
             recipient: freshTarget.email!, messageId, subject: emailSubject,
           });
+          beforeSend();
           const result = await sendEmail({ ...emailAccount, password: decryptSecret(emailAccount.password)! }, freshTarget.email!, emailSubject, finalEmailBody, { messageId });
           if (result.accepted.map(address => address.toLowerCase()).includes(freshTarget.email!.toLowerCase())) {
             markOutboundAccepted(db, actionKey(tr.id, step.id));
