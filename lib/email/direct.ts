@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import type Database from "better-sqlite3";
-import { claimAction, beginDispatch, confirmAction, holdUnknown, releaseClaim } from "@/lib/reliability/actions";
+import { initActionSchema, claimAction, beginDispatch, confirmAction, holdUnknown, releaseClaim } from "@/lib/reliability/actions";
 import { evaluateEligibility } from "@/lib/reliability/suppression";
 import { isEmailInboxFresh, registerOutboundEmail, markOutboundAccepted } from "@/lib/email/inbox";
 import { sendEmail, type EmailAccount } from "@/lib/email/sender";
@@ -17,7 +17,8 @@ export async function sendDirectEmail(db: Database.Database, input: {
   const digest = createHash("sha256").update(key).digest("hex");
   const domain = input.account.from_email.split("@")[1];
   const messageId = `<${digest}@${domain}>`;
-  const initial = gate(db, input.targetId, input.account.id, input.recipient, false, input.replyId, input.inReplyTo);
+  initActionSchema(db);
+  const initial = gate(db, input.targetId, input.account.id, input.recipient, key, false, input.replyId, input.inReplyTo);
   if (initial) return { ok: false, status: 409, error: initial };
   const claim = claimAction(db, { key, senderId: input.account.id, targetId: input.targetId, channel: "email" });
   if (!claim.claimed) return { ok: false, status: 409, error: `Action already ${claim.state}: ${claim.reason}` };
@@ -27,7 +28,7 @@ export async function sendDirectEmail(db: Database.Database, input: {
     registerOutboundEmail(db, { actionKey: key, targetId: input.targetId, emailAccountId: input.account.id,
       recipient: input.recipient, messageId, subject: input.subject,
       payloadHash: createHash("sha256").update(input.subject + "\0" + input.body + "\0" + (input.inReplyTo ?? "") + "\0" + (input.references ?? []).join(" ")).digest("hex") });
-    const begun = beginDispatch(db, key, token, () => gate(db, input.targetId, input.account.id, input.recipient, true, input.replyId, input.inReplyTo));
+    const begun = beginDispatch(db, key, token, () => gate(db, input.targetId, input.account.id, input.recipient, key, true, input.replyId, input.inReplyTo));
     if (!begun.started) {
       if (releaseClaim(db, key, token)) db.prepare("DELETE FROM email_outbound WHERE action_key = ? AND accepted_at IS NULL").run(key);
       return { ok: false, status: 409, error: begun.reason ?? "Send blocked" };
@@ -51,7 +52,7 @@ export async function sendDirectEmail(db: Database.Database, input: {
   }
 }
 
-function gate(db: Database.Database, targetId: string, accountId: string, recipient: string, registered: boolean, replyId?: string, inReplyTo?: string): string | null {
+function gate(db: Database.Database, targetId: string, accountId: string, recipient: string, actionKey: string, registered: boolean, replyId?: string, inReplyTo?: string): string | null {
   const target = db.prepare("SELECT email, email_status FROM targets WHERE id = ?")
     .get(targetId) as { email: string | null; email_status: string | null } | undefined;
   if (!target || target.email?.trim().toLowerCase() !== recipient.trim().toLowerCase()) return "Recipient identity changed";
@@ -87,10 +88,32 @@ function gate(db: Database.Database, targetId: string, accountId: string, recipi
       hour < (account.active_hours_start ?? 9) || hour >= (account.active_hours_end ?? 18)) {
     return "Outside sending schedule";
   }
-  const sentToday = db.prepare(`SELECT COUNT(*) AS count FROM email_outbound
-    WHERE email_account_id = ? AND date(created_at) = date('now')`).get(accountId) as { count: number };
-  if (sentToday.count > (account.daily_email_limit ?? 0) ||
-      (!registered && sentToday.count >= (account.daily_email_limit ?? 0))) return "Daily email limit reached";
+  // Count actual dispatch day, including uncertain outcomes. A claimed, registered
+  // action reserves capacity even if its registration happened yesterday.
+  const durable = db.prepare(`SELECT COUNT(*) AS count FROM dispatch_actions a
+    LEFT JOIN email_outbound o ON o.action_key = a.action_key
+    WHERE a.sender_id = ? AND a.channel = 'email' AND a.action_key != ?
+      AND ((a.dispatched_at IS NOT NULL AND date(COALESCE(o.accepted_at, a.dispatched_at)) = date('now'))
+        OR (a.state = 'claimed' AND o.action_key IS NOT NULL))`).get(accountId, actionKey) as { count: number };
+  const orphaned = db.prepare(`SELECT COUNT(*) AS count FROM email_outbound o
+    WHERE o.email_account_id = ? AND o.accepted_at IS NOT NULL AND date(o.accepted_at) = date('now')
+      AND NOT EXISTS (SELECT 1 FROM dispatch_actions a WHERE a.action_key = o.action_key)`)
+    .get(accountId) as { count: number };
+  // Old installs recorded sends only in logs. Keep those in cap until history ages out.
+  const legacy = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'logs'").get()
+    ? db.prepare(`SELECT COUNT(*) AS count FROM logs l
+        WHERE l.message LIKE 'Email sent%' AND date(l.created_at) = date('now')
+          AND EXISTS (SELECT 1 FROM run_profiles rp WHERE rp.run_id = l.run_id
+            AND rp.target_id = l.target_id AND rp.email_account_id = ?)
+          AND NOT EXISTS (SELECT 1 FROM email_outbound o
+            JOIN dispatch_actions a ON a.action_key = o.action_key
+            WHERE o.target_id = l.target_id AND o.email_account_id = ?
+              AND a.dispatched_at IS NOT NULL
+              AND ABS(strftime('%s', a.dispatched_at) - strftime('%s', l.created_at)) <= 600)`)
+      .get(accountId, accountId) as { count: number }
+    : { count: 0 };
+  const used = durable.count + orphaned.count + legacy.count + (registered ? 1 : 0);
+  if (registered ? used > (account.daily_email_limit ?? 0) : used >= (account.daily_email_limit ?? 0)) return "Daily email limit reached";
   const inbox = isEmailInboxFresh(db, accountId);
   if (!inbox.fresh) return `Inbox sync unavailable: ${inbox.reason}`;
   return null;

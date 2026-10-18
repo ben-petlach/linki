@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { SMTPServer } from "smtp-server";
@@ -12,6 +13,7 @@ import { initEmailReliabilitySchema, registerOutboundEmail, markOutboundAccepted
 import { initSuppressionSchema, evaluateEligibility, suppressIdentity } from "../../lib/reliability/suppression";
 import { testSmtpConnection } from "../../lib/email/sender";
 import { sendDirectEmail } from "../../lib/email/direct";
+import { claimAction, initActionSchema } from "../../lib/reliability/actions";
 import { initInboxStateSchema, recordInboxSyncSuccess } from "../../lib/reliability/inbox-state";
 
 function fixture() {
@@ -140,8 +142,7 @@ test("direct email cannot bypass incomplete inbox sync", async () => {
     });
     assert.equal(result.ok, false);
     if (!result.ok) assert.match(result.error, /Inbox sync unavailable/);
-    const actions = db.prepare("SELECT name FROM sqlite_master WHERE name='dispatch_actions'").get();
-    assert.equal(actions, undefined);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM dispatch_actions").get() as { count: number }).count, 0);
   } finally { db.close(); }
 });
 
@@ -185,6 +186,7 @@ test("direct send enforces verified sender and daily cap before SMTP", async () 
     db.prepare("UPDATE email_accounts SET is_verified=1, daily_email_limit=1 WHERE id='account'").run();
     registerOutboundEmail(db, { actionKey: "already-today", targetId: "b", emailAccountId: "account",
       recipient: "bob@example.com", messageId: "<sent-b@sender.test>", subject: "Hello" });
+    markOutboundAccepted(db, "already-today");
     const capped = await sendDirectEmail(db, input);
     assert.equal(capped.ok, false);
     if (!capped.ok) assert.match(capped.error, /Daily email limit/);
@@ -367,5 +369,43 @@ test("hard DSN after 17 KB explanatory text still suppresses exact address", asy
     assert.equal(await processInboundEmail(db, "account", report), "bounce");
     assert.equal(evaluateEligibility(db, "a", { channel: "email" }).allowed, false);
     assert.equal(evaluateEligibility(db, "b", { channel: "email" }).allowed, true);
+  } finally { db.close(); }
+});
+
+
+test("previous-day registered action consumes cap when dispatched today", async () => {
+  const db = fixture();
+  const idempotencyKey = "old-request-123";
+  const key = `manual-email:a:account:${idempotencyKey}`;
+  const messageId = `<${createHash("sha256").update(key).digest("hex")}@sender.test>`;
+  const yesterday = new Date(Date.now() - 86_400_000).toISOString();
+  const account = {
+    id: "account", from_email: "sender@sender.test", from_name: null,
+    smtp_host: "127.0.0.1", smtp_port: 1, smtp_secure: 0,
+    username: "sender", password: "pass",
+  };
+  try {
+    db.prepare("UPDATE email_accounts SET daily_email_limit=1 WHERE id='account'").run();
+    initInboxStateSchema(db);
+    recordInboxSyncSuccess(db, { accountId: "account", channel: "email" });
+    initActionSchema(db);
+    const claim = claimAction(db, { key, senderId: "account", targetId: "a", channel: "email",
+      now: Date.now() - 86_400_000, leaseMs: 60_000 });
+    assert.equal(claim.claimed, true);
+    registerOutboundEmail(db, { actionKey: key, targetId: "a", emailAccountId: "account",
+      recipient: "alice@example.com", messageId, subject: "Hello",
+      payloadHash: createHash("sha256").update("Hello\0Test\0\0").digest("hex"), createdAt: yesterday });
+    const first = await sendDirectEmail(db, { targetId: "a", account, recipient: "alice@example.com",
+      subject: "Hello", body: "Test", idempotencyKey });
+    assert.equal(first.ok, false); // local port rejects SMTP; outcome held after dispatch begins
+    const action = db.prepare("SELECT state, dispatched_at FROM dispatch_actions WHERE action_key = ?")
+      .get(key) as { state: string; dispatched_at: string | null };
+    assert.equal(action.state, "unknown");
+    assert.equal(action.dispatched_at?.slice(0, 10), new Date().toISOString().slice(0, 10));
+    assert.equal((db.prepare("SELECT created_at FROM email_outbound WHERE action_key = ?").get(key) as { created_at: string }).created_at, yesterday);
+    const next = await sendDirectEmail(db, { targetId: "a", account, recipient: "alice@example.com",
+      subject: "Another", body: "Test", idempotencyKey: "next-request-123" });
+    assert.equal(next.ok, false);
+    if (!next.ok) assert.match(next.error, /Daily email limit reached/);
   } finally { db.close(); }
 });
