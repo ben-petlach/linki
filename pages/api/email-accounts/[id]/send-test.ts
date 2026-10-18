@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { sendEmail } from "@/lib/email/sender";
 import { decryptSecret } from "@/lib/crypto";
+import { getDispatchBlockReason, initOperationsSchema } from "@/lib/reliability/operations";
+import { getProviderDispatchBlockReason } from "@/lib/reliability/provider-health";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
@@ -24,6 +26,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     } | undefined;
 
   if (!account) return res.status(404).json({ error: "not found" });
+
+  if (to.trim().toLowerCase() !== account.from_email.trim().toLowerCase()) {
+    return res.status(400).json({ error: "Test email recipient must be the sending account address" });
+  }
+
+  initOperationsSchema(db);
+  const block = getDispatchBlockReason(db) ?? getProviderDispatchBlockReason(db, id, "email");
+  if (block) return res.status(409).json({ error: block });
 
   const fullBody = buildEmailBody(body ?? "", account.signature);
 

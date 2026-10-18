@@ -2,6 +2,7 @@ import type DatabaseType from "better-sqlite3";
 import type { ScrapedProfile } from "@/lib/linkedin/scraper";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
+import { loadTargetIdentityIndex, normalizeSuppressionValue } from "@/lib/reliability/suppression";
 
 type DB = DatabaseType.Database;
 
@@ -277,7 +278,7 @@ async function runBatch(importId: string): Promise<void> {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function insertProfiles(db: DB, listId: string, profiles: any[]): { imported: number; skipped: number } {
+export function insertProfiles(db: DB, listId: string, profiles: any[]): { imported: number; skipped: number } {
   const insertTarget = db.prepare(
     `INSERT INTO targets (
        id, linkedin_url, sales_nav_url, first_name, last_name, full_name,
@@ -303,23 +304,32 @@ function insertProfiles(db: DB, listId: string, profiles: any[]): { imported: nu
        spotlight_badges = excluded.spotlight_badges`
   );
   const insertLink = db.prepare("INSERT OR IGNORE INTO list_targets (list_id, target_id) VALUES (?, ?)");
-  const findTarget = db.prepare("SELECT id FROM targets WHERE linkedin_url = ?");
+  const identities = loadTargetIdentityIndex(db);
+  const findStoredUrl = db.prepare("SELECT linkedin_url FROM targets WHERE id = ?");
 
   let imported = 0;
   let skipped = 0;
   db.transaction(() => {
     for (const p of profiles) {
-      const url = p.linkedinUrl ?? p.salesNavUrl;
+      const url = normalizeSuppressionValue("linkedin", p.linkedinUrl ?? p.salesNavUrl ?? "");
+      if (!url) { skipped++; continue; }
+      const byProfile = identities.profile(url);
+      const bySalesNav = identities.profile(p.salesNavUrl);
+      if (byProfile === null || bySalesNav === null || (byProfile && bySalesNav && byProfile !== bySalesNav)) { skipped++; continue; }
+      const existingId = byProfile ?? bySalesNav;
+      const storedUrl = existingId ? (findStoredUrl.get(existingId) as { linkedin_url: string | null }).linkedin_url : null;
+      const newId = randomUUID();
       insertTarget.run(
-        randomUUID(), url, p.salesNavUrl,
+        newId, storedUrl ?? url, p.salesNavUrl,
         p.firstName, p.lastName, p.fullName,
         p.title, p.company, p.location, p.degree,
         p.objectUrn, p.summary, p.openLink ? 1 : 0,
         p.companyIndustry, p.companyLocation,
         p.tenureMonths, p.spotlightBadges
       );
-      const target = findTarget.get(url) as { id: string };
-      const result = insertLink.run(listId, target.id);
+      const targetId = existingId ?? newId;
+      identities.register(targetId, { linkedin_url: url, sales_nav_url: p.salesNavUrl });
+      const result = insertLink.run(listId, targetId);
       if (result.changes > 0) imported++;
       else skipped++;
     }

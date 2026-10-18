@@ -30,6 +30,7 @@ const mainNav = [
   { href: "/companies", label: "Companies", icon: RiBuildingLine, color: "#a78bfa", tour: "nav-companies" },
   { href: "/workflows", label: "Campaigns", icon: RiFlowChart, color: "#f4b740", tour: "nav-workflows" },
   { href: "/inbox", label: "Inbox", icon: RiInboxLine, color: "#38bdf8", tour: "nav-inbox" },
+  { href: "/operations", label: "Operations", icon: RiCheckboxCircleLine, color: "#fb923c", tour: "nav-operations" },
   { href: "/email-health", label: "Email Health", icon: RiMailCheckLine, color: "#f4b740", tour: "nav-email-health" },
 ];
 

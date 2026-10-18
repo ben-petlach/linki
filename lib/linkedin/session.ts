@@ -29,8 +29,6 @@ function contextOptions(storageState?: object) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     storageState: storageState as any,
     viewport: { width: 1920, height: 1080 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     locale: "en-US",
     timezoneId: "America/New_York",
     permissions: ["clipboard-read", "clipboard-write"] as ("clipboard-read" | "clipboard-write")[],
@@ -160,15 +158,18 @@ export async function getSessionPage(accountId: string): Promise<Page> {
   return page;
 }
 
-export async function saveSessionState(accountId: string): Promise<void> {
+export async function saveSessionState(accountId: string, stillOwnsLease?: () => boolean): Promise<void> {
+  if (stillOwnsLease && !stillOwnsLease()) return;
   const ctx = contexts.get(accountId);
   if (!ctx) return;
-  const db = getDb();
   const state = await ctx.storageState();
-  db.prepare("UPDATE accounts SET cookies_json = ?, is_authenticated = 1 WHERE id = ?").run(
-    encryptSecret(JSON.stringify(state)),
-    accountId
-  );
+  if (stillOwnsLease && !stillOwnsLease()) return;
+  const db = getDb();
+  const encrypted = encryptSecret(JSON.stringify(state));
+  db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) return;
+    db.prepare("UPDATE accounts SET cookies_json = ?, is_authenticated = 1 WHERE id = ?").run(encrypted, accountId);
+  }).immediate();
 }
 
 export async function closeSession(accountId: string): Promise<void> {
@@ -184,10 +185,18 @@ export async function closeSession(accountId: string): Promise<void> {
  * so the runner stops working a dead session (no more 30s-timeout fail-loop),
  * and drops the live context. The user re-authenticates from Settings.
  */
-export async function markNeedsReauth(accountId: string): Promise<void> {
+export async function markNeedsReauth(accountId: string, stillOwnsLease?: () => boolean): Promise<void> {
+  if (stillOwnsLease && !stillOwnsLease()) return;
   const db = getDb();
-  db.prepare("UPDATE accounts SET is_authenticated = 0 WHERE id = ?").run(accountId);
-  try { await closeSession(accountId); } catch { /* ignore */ }
+  const updated = db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) return false;
+    db.prepare("UPDATE accounts SET is_authenticated = 0 WHERE id = ?").run(accountId);
+    return true;
+  }).immediate();
+  if (!updated) return;
+  if (!stillOwnsLease || stillOwnsLease()) {
+    try { await closeSession(accountId); } catch { /* ignore */ }
+  }
   console.warn(`[session] account ${accountId} flagged needs-reauth (session logged out)`);
 }
 
@@ -219,13 +228,7 @@ export async function authenticateAccount(accountId: string): Promise<void> {
   });
 
   try {
-    const ctx = await visibleBrowser.newContext({
-      viewport: { width: 1440, height: 900 },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      locale: "en-US",
-      timezoneId: "America/New_York",
-    });
+    const ctx = await visibleBrowser.newContext(contextOptions());
 
     const page = await ctx.newPage();
     await page.goto("https://www.linkedin.com/login");

@@ -1,0 +1,310 @@
+[
+  {
+    "file": "components/layout/Layout.tsx",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'_c' is defined but never used.",
+    "severity": 1,
+    "source": "const handleCollapse = useCallback((_c: boolean) => {}, []);"
+  },
+  {
+    "file": "components/ui/FilterBar.tsx",
+    "ruleId": null,
+    "message": "Unused eslint-disable directive (no problems were reported from '@typescript-eslint/no-explicit-any').",
+    "severity": 1,
+    "source": "// eslint-disable-next-line @typescript-eslint/no-explicit-any"
+  },
+  {
+    "file": "components/ui/ModelPicker.tsx",
+    "ruleId": "@typescript-eslint/no-unused-expressions",
+    "message": "Expected an assignment or function call and instead saw an expression.",
+    "severity": 1,
+    "source": "n.has(p) ? n.delete(p) : n.add(p);"
+  },
+  {
+    "file": "lib/linkedin/enrich.ts",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'InterceptedResponse' is defined but never used.",
+    "severity": 1,
+    "source": "interface InterceptedResponse {"
+  },
+  {
+    "file": "lib/linkedin/runner.ts",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'runId' is defined but never used.",
+    "severity": 1,
+    "source": "async function ensureApolloEnriched(db: ReturnType<typeof getDb>, target: Target, runId: string): Promise<void> {"
+  },
+  {
+    "file": "lib/linkedin/scraper.ts",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'enrichWithFlagshipUrls' is defined but never used.",
+    "severity": 1,
+    "source": "async function enrichWithFlagshipUrls("
+  },
+  {
+    "file": "pages/api/runs/index.ts",
+    "ruleId": "prefer-const",
+    "message": "'emailAssignment' is never reassigned. Use 'const' instead.",
+    "severity": 2,
+    "source": "let emailAssignment: Map<string, string | null> = new Map();"
+  },
+  {
+    "file": "pages/companies/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'Field' is defined but never used.",
+    "severity": 1,
+    "source": "function Field({ label, value }: { label: string; value: React.ReactNode }) {"
+  },
+  {
+    "file": "pages/contacts/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'_rid' is defined but never used.",
+    "severity": 1,
+    "source": "logs: (logsByRun[r.run_id] ?? []).map(({ run_id: _rid, ...l }) => l),"
+  },
+  {
+    "file": "pages/contacts/index.tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "fetch_(page, listId, debouncedSearch, filters);"
+  },
+  {
+    "file": "pages/contacts/index.tsx",
+    "ruleId": "@typescript-eslint/no-unused-expressions",
+    "message": "Expected an assignment or function call and instead saw an expression.",
+    "severity": 1,
+    "source": "setSelected((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });"
+  },
+  {
+    "file": "pages/email-health.tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "useEffect(() => { load(); }, [load]);"
+  },
+  {
+    "file": "pages/lists/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-expressions",
+    "message": "Expected an assignment or function call and instead saw an expression.",
+    "severity": 1,
+    "source": "setSelected((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });"
+  },
+  {
+    "file": "pages/lists/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'deleteSelected' is defined but never used.",
+    "severity": 1,
+    "source": "async function deleteSelected() {"
+  },
+  {
+    "file": "pages/settings.tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "if (viewingParent && childrenOf(viewingParent.id).length === 0) setViewingParent(null);"
+  },
+  {
+    "file": "pages/settings.tsx",
+    "ruleId": "react-hooks/exhaustive-deps",
+    "message": "React Hook useEffect has a missing dependency: 'childrenOf'. Either include it or remove the dependency array.",
+    "severity": 1,
+    "source": "}, [accounts, viewingParent]);"
+  },
+  {
+    "file": "pages/settings.tsx",
+    "ruleId": "react/no-unescaped-entities",
+    "message": "`'` can be escaped with `&apos;`, `&lsquo;`, `&#39;`, `&rsquo;`.",
+    "severity": 2,
+    "source": "Uses <span className=\"text-base-content/60 font-mono\">{senderParent.name}</span>'s SMTP/IMAP credentials — only the sender identity below is new."
+  },
+  {
+    "file": "pages/settings.tsx",
+    "ruleId": "react/no-unescaped-entities",
+    "message": "`'` can be escaped with `&apos;`, `&lsquo;`, `&#39;`, `&rsquo;`.",
+    "severity": 2,
+    "source": "<p className=\"text-xs text-base-content/40 mb-4\">All share {viewingParent.name}'s SMTP/IMAP credentials.</p>"
+  },
+  {
+    "file": "pages/settings.tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "setMcpUrl(`${window.location.origin}/api/mcp`);"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-vars",
+    "message": "'FILTER_FIELDS' is defined but never used.",
+    "severity": 1,
+    "source": "import FilterBar, { ActiveFilter, filtersToParams, FILTER_FIELDS } from \"@/components/ui/FilterBar\";"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-expressions",
+    "message": "Expected an assignment or function call and instead saw an expression.",
+    "severity": 1,
+    "source": "onToggleProvider={(p) => setCollapsedProviders(prev => { const n = new Set(prev); n.has(p) ? n.delete(p) : n.add(p); return n; })}"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-expressions",
+    "message": "Expected an assignment or function call and instead saw an expression.",
+    "severity": 1,
+    "source": "onToggleProvider={(p) => setCollapsedProviders(prev => { const n = new Set(prev); n.has(p) ? n.delete(p) : n.add(p); return n; })}"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "setLoading(true);"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"Prospects\" value={funnel.total} color=\"#808080\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"Connections sent\" value={funnel.connections_sent} color=\"#32d583\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"Connected\" value={funnel.connected} color=\"#32d583\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"LI Messages\" value={funnel.messages_sent} color=\"#f4b740\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"InMails sent\" value={funnel.inmails_sent} color=\"#e879f9\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"LI Replies\" value={funnel.li_replies} color=\"#c084fc\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"Emails sent\" value={funnel.emails_sent} color=\"#fb923c\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"Email replies\" value={funnel.email_replies} color=\"#32d583\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/static-components",
+    "message": "Error: Cannot create components during render\n\nComponents created during render will reset their state each time they are created. Declare components outside of render.",
+    "severity": 2,
+    "source": "<FunnelBar label=\"Completed\" value={funnel.completed} color=\"#5aa2ff\" />"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/exhaustive-deps",
+    "message": "React Hook useEffect has missing dependencies: 'autoSetup', 'initial.id', and 'router'. Either include them or remove the dependency array.",
+    "severity": 1,
+    "source": "}, []);"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "useEffect(() => { setProspectsPage(0); }, [selectedStep, search, prospectFilters]);"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "refreshStats();"
+  },
+  {
+    "file": "pages/workflows/[id].tsx",
+    "ruleId": "@typescript-eslint/no-unused-expressions",
+    "message": "Expected an assignment or function call and instead saw an expression.",
+    "severity": 1,
+    "source": "onChange={() => setSelected((prev) => { const n = new Set(prev); n.has(p.target_id) ? n.delete(p.target_id) : n.add(p.target_id); return n; })}"
+  },
+  {
+    "file": "scripts/force-next-step.js",
+    "ruleId": "@typescript-eslint/no-require-imports",
+    "message": "A `require()` style import is forbidden.",
+    "severity": 2,
+    "source": "const path = require(\"path\");"
+  },
+  {
+    "file": "scripts/force-next-step.js",
+    "ruleId": "@typescript-eslint/no-require-imports",
+    "message": "A `require()` style import is forbidden.",
+    "severity": 2,
+    "source": "const Database = require(\"better-sqlite3\");"
+  },
+  {
+    "file": "scripts/mirror-ee.js",
+    "ruleId": "@typescript-eslint/no-require-imports",
+    "message": "A `require()` style import is forbidden.",
+    "severity": 2,
+    "source": "const fs = require(\"fs\");"
+  },
+  {
+    "file": "scripts/mirror-ee.js",
+    "ruleId": "@typescript-eslint/no-require-imports",
+    "message": "A `require()` style import is forbidden.",
+    "severity": 2,
+    "source": "const path = require(\"path\");"
+  },
+  {
+    "file": "scripts/strip-mirrored-pages.js",
+    "ruleId": "@typescript-eslint/no-require-imports",
+    "message": "A `require()` style import is forbidden.",
+    "severity": 2,
+    "source": "const fs = require(\"fs\");"
+  },
+  {
+    "file": "scripts/strip-mirrored-pages.js",
+    "ruleId": "@typescript-eslint/no-require-imports",
+    "message": "A `require()` style import is forbidden.",
+    "severity": 2,
+    "source": "const path = require(\"path\");"
+  },
+  {
+    "file": "pages/inbox.tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "setLoadingThread(false);"
+  },
+  {
+    "file": "pages/lists/[id].tsx",
+    "ruleId": "@next/next/no-location-assign-relative-destination",
+    "message": "Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination",
+    "severity": 1,
+    "source": "window.location.href = `/api/lists/${initialList.id}/csv-template`;"
+  }
+]

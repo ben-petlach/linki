@@ -2,7 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import Imap from "imap";
 import { simpleParser } from "mailparser";
 import { getDb } from "@/lib/db";
-import { sendEmail, type EmailAccount } from "@/lib/email/sender";
+import { sendDirectEmail } from "@/lib/email/direct";
 import { decryptSecret } from "@/lib/crypto";
 
 // Email conversation for one contact, account-resolved automatically so callers (incl. the MCP)
@@ -85,8 +85,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   // ── Send / reply ──
   if (req.method === "POST") {
-    const { subject, body, email_account_id } = req.body as {
-      subject?: string; body?: string; email_account_id?: string;
+    const { subject, body, email_account_id, idempotencyKey } = req.body as {
+      subject?: string; body?: string; email_account_id?: string; idempotencyKey?: string;
     };
     if (!body?.trim()) return res.status(400).json({ error: "body is required" });
 
@@ -104,16 +104,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         : "Re:";
     }
 
-    try {
-      await sendEmail(
-        { ...account, password: decryptSecret(account.password)! } as EmailAccount,
-        target.email, finalSubject, body
-      );
-      return res.json({ ok: true, email_account_id: account.id, to: target.email, subject: finalSubject });
-    } catch (err) {
-      console.error("[targets/emails] send failed:", err);
-      return res.status(500).json({ error: err instanceof Error ? err.message : "Send failed" });
-    }
+    const result = await sendDirectEmail(db, {
+      targetId, account: { ...account, password: decryptSecret(account.password)! },
+      recipient: target.email, subject: finalSubject, body,
+      idempotencyKey: idempotencyKey ?? req.headers["idempotency-key"]?.toString() ?? "",
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    return res.json({ ok: true, email_account_id: account.id, to: target.email,
+      subject: finalSubject, messageId: result.messageId });
   }
 
   res.setHeader("Allow", ["GET", "POST"]);
@@ -130,7 +128,7 @@ async function fetchThread(cfg: ImapConfig, contactEmail: string): Promise<Email
   return new Promise((resolve, reject) => {
     const imap = new Imap({
       host: cfg.host, port: cfg.port, tls: true,
-      tlsOptions: { rejectUnauthorized: false },
+      tlsOptions: { rejectUnauthorized: true },
       user: cfg.user, password: cfg.password,
       authTimeout: 10_000, connTimeout: 12_000,
     });

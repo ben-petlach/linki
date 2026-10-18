@@ -94,6 +94,7 @@ function ReplyModal({ reply, onClose, onActionDone, hasPremium }: ReplyModalProp
   const [replyText, setReplyText] = useState("");
   const [replySubject, setReplySubject] = useState("");
   const [sending, setSending] = useState(false);
+  const sendAttempt = useRef<{ payload: string; key: string } | null>(null);
   const [acting, setActing] = useState<"reclassify" | "cancel" | null>(null);
   const threadEndRef = useRef<HTMLDivElement>(null);
 
@@ -164,13 +165,20 @@ function ReplyModal({ reply, onClose, onActionDone, hasPremium }: ReplyModalProp
   }, [messages]);
 
   async function handleSend() {
-    if (!replyText.trim() || !reply.email || !reply.email_account_id) return;
+    if (sending || !replyText.trim() || !reply.email || !reply.email_account_id) return;
+    const payload = JSON.stringify([reply.id, reply.reply_id, reply.email_account_id, reply.email, replySubject, replyText]);
+    if (sendAttempt.current?.payload !== payload) {
+      sendAttempt.current = { payload, key: crypto.randomUUID() };
+    }
     setSending(true);
     try {
       const r = await fetch("/api/inbox/reply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          targetId: reply.id,
+          idempotencyKey: sendAttempt.current.key,
+          replyId: reply.reply_id,
           emailAccountId: reply.email_account_id,
           to: reply.email,
           subject: replySubject,
@@ -179,6 +187,7 @@ function ReplyModal({ reply, onClose, onActionDone, hasPremium }: ReplyModalProp
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error ?? "Send failed");
+      sendAttempt.current = null;
       toast.success("Reply sent");
       setReplyText("");
     } catch (err) {

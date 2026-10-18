@@ -1,138 +1,77 @@
 import type { Page } from "playwright";
-import { visitProfile } from "./visit";
+import { LinkedInLayoutError, normalizedProfileUrl, visitProfile } from "./visit";
+import { outboundMessageIds } from "./inbox";
 
 export class NotConnectedError extends Error {}
+/** A click may have reached LinkedIn. Callers must hold for review, never retry blindly. */
+export class UnconfirmedSendError extends Error {}
 
 export interface SendMessageResult {
-  messagingUrn: string | null;
-  isFirstDegree: boolean;
+  messagingUrn: string;
+  isFirstDegree: true;
+  evidence: string;
 }
 
-/**
- * Sends a message to a LinkedIn 1st-degree connection.
- *
- * Self-contained URN resolution — does NOT depend on a prior 'visit' workflow
- * step. If messagingUrn is already cached, it's used directly (no extra page
- * load). Otherwise this does its own live profile check (the same top-card-
- * scoped logic as the 'visit' step, see visit.ts) to fetch a fresh URN and
- * verify the target is still actually connected, immediately before sending.
- * Only if that live check finds no URN despite confirming 1st-degree does it
- * fall back to the connections-only name-search typeahead — a rare last
- * resort now, not the default path for every contact that lacks a cached URN.
- *
- * Throws NotConnectedError if the live check finds the target is NOT 1st-
- * degree, instead of guessing via typeahead search (which can silently hit
- * an unrelated connection with a similar/truncated name — see CLAUDE.md /
- * memory for the Jul 2026 incident this replaced).
- *
- * Returns the resolved { messagingUrn, isFirstDegree } so the caller can
- * persist it to the target record, same as the 'visit' step does.
- */
+/** Require fresh exact profile evidence even when a cached messaging URN exists. */
 export async function sendMessage(
   page: Page,
   fullName: string,
   text: string,
   linkedinUrl: string,
-  messagingUrn?: string | null
+  _cachedMessagingUrn?: string | null,
+  beforeSend?: () => void
 ): Promise<SendMessageResult> {
-  if (messagingUrn) {
-    const opened = await openComposeByUrn(page, messagingUrn);
-    if (opened) {
-      await sendFromComposeBox(page, text);
-      return { messagingUrn, isFirstDegree: true };
-    }
+  void _cachedMessagingUrn; // Kept for caller compatibility; only fresh profile evidence is trusted.
+  const identity = normalizedProfileUrl(linkedinUrl);
+  if (!identity) throw new LinkedInLayoutError("Target has no exact LinkedIn profile URL");
+  const live = await visitProfile(page, identity);
+  if (!live.isFirstDegree) throw new NotConnectedError(`${fullName} has no verified first-degree message link`);
+  if (!live.messagingUrn) throw new LinkedInLayoutError("Connected profile has no messaging URN");
+
+  const composeUrl = new URL("https://www.linkedin.com/messaging/compose/");
+  composeUrl.searchParams.set("profileUrn", live.messagingUrn);
+  composeUrl.searchParams.set("recipient", live.messagingUrn.split(":").pop()!);
+  await page.goto(composeUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30000 });
+  if (!page.url().startsWith("https://www.linkedin.com/messaging/")) {
+    throw new LinkedInLayoutError("LinkedIn compose unavailable or session checkpoint");
   }
 
-  const resolved = await visitProfile(page, linkedinUrl);
-  if (resolved.messagingUrn) {
-    const opened = await openComposeByUrn(page, resolved.messagingUrn);
-    if (opened) {
-      await sendFromComposeBox(page, text);
-      return resolved;
-    }
-  }
-  if (!resolved.isFirstDegree) {
-    throw new NotConnectedError(`${fullName} is not a 1st-degree connection — refusing to message`);
+  // The compose UI must independently confirm the recipient's exact profile.
+  const recipientLinks = page.locator('.profile-card-one-to-one__profile-link[href*="/in/"]');
+  const recipients = await recipientLinks.evaluateAll((nodes) =>
+    nodes.map((node) => (node as HTMLAnchorElement).href)
+  );
+  if (recipients.length !== 1 || normalizedProfileUrl(recipients[0]) !== identity) {
+    throw new LinkedInLayoutError("Compose recipient identity is missing or differs from target");
   }
 
-  // Connected, but no message link could be resolved live (unusual layout) —
-  // last-resort fallback to name search.
-  await sendMessageViaTypeahead(page, fullName, text);
-  return resolved;
-}
-
-async function openComposeByUrn(page: Page, messagingUrn: string): Promise<boolean> {
+  const msgInput = page.locator("div.msg-form__contenteditable");
+  const sendBtn = page.locator("button.msg-form__send-button:visible");
+  if (await msgInput.count() !== 1 || await sendBtn.count() !== 1) {
+    throw new LinkedInLayoutError("LinkedIn compose controls missing or ambiguous");
+  }
+  let before: Set<string>;
   try {
-    const recipientId = messagingUrn.split(":").pop();
-    const composeUrl = `https://www.linkedin.com/messaging/compose/?profileUrn=${encodeURIComponent(messagingUrn)}&recipient=${recipientId}`;
-    await page.goto(composeUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(1500 + Math.random() * 1000);
-    const msgInput = page.locator("div.msg-form__contenteditable").first();
-    await msgInput.waitFor({ timeout: 8000 });
-    return true;
-  } catch {
-    return false;
+    before = await outboundMessageIds(page, identity, text);
+  } catch (error) {
+    throw new LinkedInLayoutError(`Cannot establish LinkedIn outbound baseline: ${error instanceof Error ? error.message : String(error)}`);
   }
-}
-
-async function sendMessageViaTypeahead(page: Page, fullName: string, text: string): Promise<void> {
-  await page.goto("https://www.linkedin.com/messaging/thread/new/", {
-    waitUntil: "domcontentloaded",
-    timeout: 30000,
-  });
-  await page.waitForTimeout(1500 + Math.random() * 1000);
-
-  // Search for recipient by name
-  const searchField = page.locator("input.msg-connections-typeahead__search-field").first();
-  await searchField.waitFor({ timeout: 10000 });
-  await searchField.click();
-  await searchField.type(fullName, { delay: 60 + Math.random() * 40 });
-  await page.waitForTimeout(1500);
-
-  // Select first result — but verify it's actually the intended person first.
-  // This search only returns 1st-degree connections; if the real target isn't
-  // connected, LinkedIn will still happily return a same/similar-named
-  // connection as the top result, and we'd silently message a stranger.
-  const firstResult = page.locator('div[class*="msg-connections-typeahead__search-result-row"]').first();
-  await firstResult.waitFor({ timeout: 8000 });
-  const resultText = (await firstResult.innerText().catch(() => "")).trim();
-  if (!resultNameMatches(resultText, fullName)) {
-    throw new Error(
-      `Typeahead search for "${fullName}" returned a non-matching result ("${resultText.replace(/\s+/g, " ")}") — refusing to send to avoid messaging the wrong person`
-    );
+  await msgInput.fill(text);
+  if ((await msgInput.innerText()).trim() !== text.trim()) {
+    throw new LinkedInLayoutError("Composed message differs from requested text");
   }
-  await firstResult.click({ delay: 100 });
-  await page.waitForTimeout(800);
+  beforeSend?.();
+  await sendBtn.click();
 
-  await sendFromComposeBox(page, text);
-}
-
-function resultNameMatches(resultText: string, fullName: string): boolean {
-  const normalize = (s: string) =>
-    s.toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
-  const target = normalize(fullName);
-  if (!target) return false;
-  return normalize(resultText).includes(target);
-}
-
-async function sendFromComposeBox(page: Page, text: string): Promise<void> {
-  // Paste message into compose area
-  const msgInput = page.locator("div.msg-form__contenteditable").first();
-  await msgInput.waitFor({ timeout: 8000 });
-  await msgInput.click();
-  try {
-    await page.evaluate((t) => navigator.clipboard.writeText(t), text);
-    await page.waitForTimeout(300);
-    await msgInput.press("Control+V");
-  } catch {
-    // Clipboard blocked in headless — fall back to keyboard typing
-    await msgInput.pressSequentially(text, { delay: 20 });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const after = await outboundMessageIds(page, identity, text);
+      const evidence = [...after].find((id) => !before.has(id));
+      if (evidence) return { messagingUrn: live.messagingUrn, isFirstDegree: true, evidence };
+    } catch {
+      // The click may have reached LinkedIn; retain the unknown outcome.
+    }
+    if (attempt < 3) await page.waitForTimeout(1500);
   }
-  await page.waitForTimeout(500);
-
-  // Send
-  const sendBtn = page.locator("button.msg-form__send-button:visible").first();
-  await sendBtn.waitFor({ timeout: 5000 });
-  await sendBtn.click({ delay: 100 });
-  await page.waitForTimeout(2000);
+  throw new UnconfirmedSendError("Send clicked but no new matching LinkedIn outbound event was observed");
 }

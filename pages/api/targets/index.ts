@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import type { ActiveFilter, FilterOp } from "@/components/ui/FilterBar";
+import { loadTargetIdentityIndex, normalizeSuppressionValue, preserveTargetSuppressionOnDelete } from "@/lib/reliability/suppression";
 
 // Parse f[0][field], f[0][op], f[0][value], f[1][field], ... from query
 function parseFilters(query: NextApiRequest["query"]): ActiveFilter[] {
@@ -119,12 +120,18 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     if (!full_name || !linkedin_url) {
       return res.status(400).json({ error: "full_name and linkedin_url are required" });
     }
+    const profile = normalizeSuppressionValue("linkedin", linkedin_url);
+    if (!profile) return res.status(400).json({ error: "valid LinkedIn profile URL required" });
+    const identities = loadTargetIdentityIndex(db);
+    if (identities.profile(profile) !== undefined || (email && identities.email(email) !== undefined)) {
+      return res.status(409).json({ error: "contact identity already exists or is ambiguous" });
+    }
     const id = randomUUID();
     try {
       db.prepare(
         `INSERT INTO targets (id, full_name, linkedin_url, title, company, location, email, phone)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, full_name, linkedin_url, title ?? null, company ?? null, location ?? null, email ?? null, phone ?? null);
+      ).run(id, full_name, profile, title ?? null, company ?? null, location ?? null, email ?? null, phone ?? null);
     } catch (e: unknown) {
       if (e instanceof Error && e.message.includes("UNIQUE")) {
         return res.status(409).json({ error: "A contact with this LinkedIn URL already exists" });
@@ -149,6 +156,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     // run_profiles/logs have no ON DELETE CASCADE — clear them first so the FK
     // constraint doesn't block the delete. run_profile_tracks cascade off run_profiles.
     const result = db.transaction(() => {
+      for (const id of target_ids) preserveTargetSuppressionOnDelete(db, id);
       db.prepare(`DELETE FROM run_profiles WHERE target_id IN (${placeholders})`).run(...target_ids);
       db.prepare(`DELETE FROM logs WHERE target_id IN (${placeholders})`).run(...target_ids);
       return db.prepare(`DELETE FROM targets WHERE id IN (${placeholders})`).run(...target_ids);

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "crypto";
+import { loadTargetIdentityIndex, normalizeSuppressionValue, preserveSuppressionBeforeEmailUpdate } from "@/lib/reliability/suppression";
 
 const APOLLO_BASE = "https://api.apollo.io/api/v1";
 
@@ -322,8 +323,17 @@ export function applyApolloMatchResult(
   targetId: string,
   result: ApolloMatchResult
 ): void {
+  const target = db.prepare("SELECT linkedin_url, email FROM targets WHERE id = ?").get(targetId) as { linkedin_url: string | null; email: string | null } | undefined;
+  if (!target) return;
+  const apolloLinkedinUrl = result.linkedin_url ? normalizeSuppressionValue("linkedin", result.linkedin_url) : null;
+  const storedProfile = target.linkedin_url ? normalizeSuppressionValue("linkedin", target.linkedin_url) : null;
+  if (apolloLinkedinUrl && storedProfile && apolloLinkedinUrl !== storedProfile) return;
+  const identities = loadTargetIdentityIndex(db);
+  const profileOwner = identities.profile(apolloLinkedinUrl);
+  const emailOwner = identities.email(result.email);
+  if (profileOwner === null || (profileOwner && profileOwner !== targetId) || emailOwner === null || (emailOwner && emailOwner !== targetId)) return;
+  preserveSuppressionBeforeEmailUpdate(db, targetId, result.email);
   const companyId = result.organization ? upsertCompanyFromOrg(db, result.organization) : null;
-  const apolloLinkedinUrl = result.linkedin_url?.includes("/in/") ? result.linkedin_url : null;
 
   db.prepare(`
     UPDATE targets SET

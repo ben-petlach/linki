@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { randomUUID } from "crypto";
 import { getDb } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
+import { loadTargetIdentityIndex, normalizeSuppressionValue, preserveSuppressionBeforeEmailUpdate } from "@/lib/reliability/suppression";
 import {
   searchContactsByLabel,
   matchPerson,
@@ -58,31 +59,42 @@ const insertTargetSql = `
     company_id = COALESCE(company_id, excluded.company_id)
 `;
 
-function insertContacts(
+export function insertContacts(
   db: DB,
   listId: string,
   contacts: ApolloListContact[]
 ): { imported: number; skipped: number } {
   const insertTarget = db.prepare(insertTargetSql);
   const insertLink = db.prepare("INSERT OR IGNORE INTO list_targets (list_id, target_id) VALUES (?, ?)");
-  const findTarget = db.prepare("SELECT id FROM targets WHERE linkedin_url = ?");
+  const identities = loadTargetIdentityIndex(db);
+  const findStoredUrl = db.prepare("SELECT linkedin_url FROM targets WHERE id = ?");
 
   let imported = 0;
   let skipped = 0;
 
   db.transaction(() => {
     for (const c of contacts) {
-      if (!c.linkedinUrl) {
+      const profile = c.linkedinUrl ? normalizeSuppressionValue("linkedin", c.linkedinUrl) : null;
+      if (!profile) {
         skipped++;
         continue;
       }
+      const byProfile = identities.profile(profile);
+      const byEmail = identities.email(c.email);
+      if (byProfile === null || byEmail === null || (byProfile && byEmail && byProfile !== byEmail) || (!byProfile && byEmail)) {
+        skipped++;
+        continue;
+      }
+      const storedUrl = byProfile ? (findStoredUrl.get(byProfile) as { linkedin_url: string | null }).linkedin_url : null;
+      if (byProfile) preserveSuppressionBeforeEmailUpdate(db, byProfile, c.email);
       const companyId = c.organization
         ? upsertCompanyFromOrg(db, { ...c.organization, name: c.organizationName })
         : null;
 
+      const newId = randomUUID();
       insertTarget.run(
-        randomUUID(),
-        c.linkedinUrl,
+        newId,
+        storedUrl ?? profile,
         c.firstName,
         c.lastName,
         c.fullName,
@@ -100,8 +112,9 @@ function insertContacts(
         companyId,
         c.email ? new Date().toISOString() : null
       );
-      const target = findTarget.get(c.linkedinUrl) as { id: string };
-      const result = insertLink.run(listId, target.id);
+      const targetId = byProfile ?? newId;
+      identities.register(targetId, { linkedin_url: profile, email: c.email });
+      const result = insertLink.run(listId, targetId);
       if (result.changes > 0) imported++;
       else skipped++;
     }
@@ -162,15 +175,14 @@ async function runApolloImport(importId: string): Promise<void> {
       skipped += skip;
 
       if (job.enrich === 1) {
+        const identities = loadTargetIdentityIndex(db);
         for (const c of result.contacts) {
           if (!c.linkedinUrl) continue;
           try {
             const matchResult = await matchPerson(c.linkedinUrl, apiKey);
             if (matchResult) {
-              const target = db.prepare("SELECT id FROM targets WHERE linkedin_url = ?").get(c.linkedinUrl) as
-                | { id: string }
-                | undefined;
-              if (target) applyApolloMatchResult(db, target.id, matchResult);
+              const targetId = identities.profile(c.linkedinUrl);
+              if (targetId) applyApolloMatchResult(db, targetId, matchResult);
             }
           } catch {
             // leave the base import data, move on

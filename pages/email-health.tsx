@@ -48,7 +48,7 @@ export default function EmailHealth() {
       .finally(() => setLoading(false));
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { void Promise.resolve().then(load); }, [load]);
 
   // Auto-refresh every 60s
   useEffect(() => {
@@ -71,7 +71,7 @@ export default function EmailHealth() {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-xl font-semibold text-base-content">Email Health</h1>
-            <p className="text-sm text-base-content/50 mt-0.5">Daily send volume per account vs ramp limits</p>
+            <p className="text-sm text-base-content/50 mt-0.5">Durable SMTP acceptances per account vs ramp limits; legacy log-only sends are excluded</p>
           </div>
           <div className="flex items-center gap-3">
             {lastRefresh && (
@@ -93,7 +93,7 @@ export default function EmailHealth() {
         {/* Summary pills */}
         <div className="flex items-center gap-4 mb-8">
           <div className="px-4 py-3 rounded-xl bg-base-200 border border-base-300/50">
-            <div className="text-xs text-base-content/40 mb-1">Sent today</div>
+            <div className="text-xs text-base-content/40 mb-1">SMTP accepted today</div>
             <div className="text-2xl font-semibold text-base-content">{totalToday}</div>
           </div>
           <div className="px-4 py-3 rounded-xl bg-base-200 border border-base-300/50">
@@ -215,7 +215,7 @@ export default function EmailHealth() {
           {/* Recent send log */}
           <div className="bg-base-200 rounded-xl border border-base-300/50 overflow-hidden">
             <div className="px-5 py-3 border-b border-base-300/40">
-              <span className="text-sm font-medium text-base-content">Recent sends</span>
+              <span className="text-sm font-medium text-base-content">Recent SMTP acceptances</span>
               <span className="ml-2 text-xs text-base-content/30">last 50</span>
             </div>
             <div className="divide-y divide-base-300/20 max-h-96 overflow-y-auto">
@@ -224,7 +224,7 @@ export default function EmailHealth() {
                 return (
                   <div key={i} className="px-5 py-2.5 flex items-start justify-between gap-4">
                     <div>
-                      <div className="text-xs text-base-content/80">{l.message.replace("Email sent to ", "")}</div>
+                      <div className="text-xs text-base-content/80">{l.message}</div>
                       <div className="text-[10px] text-base-content/30 mt-0.5">{acc?.name ?? l.email_account_id.slice(0, 8)}</div>
                     </div>
                     <div className="text-[10px] text-base-content/30 whitespace-nowrap shrink-0">{formatDateTime(l.created_at)}</div>
@@ -232,7 +232,7 @@ export default function EmailHealth() {
                 );
               })}
               {data?.recentLogs.length === 0 && (
-                <div className="px-5 py-6 text-xs text-base-content/30 text-center">No sends recorded</div>
+                <div className="px-5 py-6 text-xs text-base-content/30 text-center">No SMTP acceptances recorded</div>
               )}
             </div>
           </div>

@@ -1,256 +1,200 @@
+import type Database from "better-sqlite3";
 import type { Page } from "playwright";
 import { getDb } from "@/lib/db";
 import { getSessionPage, saveSessionState, markNeedsReauth } from "@/lib/linkedin/session";
+import { initRelationshipSchema, recordConnectedEvidence } from "@/lib/reliability/relationships";
 
-/**
- * Accepted-connection sync via the authoritative Voyager connections API.
- *
- * Replaces the old absence-inference (scroll the SENT list, treat a vanished
- * invite as "accepted"). That was measurably wrong: of 1,600 contacts it had
- * marked degree=1, only 325 were genuinely connected — 1,275 were phantoms
- * (invites that expired/withdrew/were ignored, not accepted). See docs §19.
- *
- * Sources — all proved against prod (Jul 2026), NO scrolling:
- *  - DATA: GET /voyager/api/relationships/dash/connections
- *          ?decorationId=…ConnectionListWithProfile-16&q=search
- *          &sortType=RECENTLY_ADDED&start=N&count=100
- *      → data["*elements"] (newest-first) + included[]: Connection { createdAt(ms),
- *        connectedMember } and Profile { publicIdentifier (vanity), entityUrn }.
- *      The API paginates to the end (30 pages for ~2947) in ~60s. It does NOT
- *      expose a grand total.
- *  - TOTAL (checksum): the connections PAGE header "<N> connections" <p>. Read
- *    once per full pass via a single navigation (NO scroll). A full pass is
- *    "verified complete" only when unique-pulled == declared total (matched ±0
- *    in prod). Presence in the list = 100% proof of a 1st-degree connection.
- *
- * Behaviour:
- *  - First run (boundary NULL) → FULL pass: page to the end, stamp degree=1 +
- *    connected_at from createdAt for every matched contact. If the pass is
- *    checksum-verified complete, ALSO un-mark phantom degree=1 contacts whose
- *    vanity is absent from the authoritative list (resets degree/connected_at).
- *  - Later runs → incremental: page from start=0 and STOP at the first
- *    connection older than the stored boundary (minus a 24h overlap margin).
- *    Incremental/incomplete passes are ADD-ONLY — they never un-mark (a partial
- *    pull must not wipe real accepts). Un-marking happens ONLY on a verified
- *    full pass.
- *  - Reuses the runner's shared browser (getSessionPage) — never a 2nd browser.
- */
-
-const ACCEPTED_SYNC_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8h — 3x per day
+const ACCEPTED_SYNC_INTERVAL_MS = 8 * 60 * 60 * 1000;
 const PAGE_SIZE = 100;
-const MAX_PAGES = 60; // safety cap (60 * 100 = 6000)
-const OVERLAP_MARGIN_MS = 24 * 60 * 60 * 1000; // re-check a day of overlap (idempotent)
+const MAX_PAGES = 60;
 const DECORATION = "com.linkedin.voyager.dash.deco.web.mynetwork.ConnectionListWithProfile-16";
+
+export interface ApiConnection {
+  profileId: string;
+  vanity: string | null;
+  createdAt: number;
+}
+
+export interface ConnectionProvider {
+  getDeclaredTotal(): Promise<number | null>;
+  getPage(start: number, count: number): Promise<ApiConnection[] | null>;
+}
 
 export function shouldSyncAccepted(accountId: string): boolean {
   const db = getDb();
+  initRelationshipSchema(db);
+  const failure = db.prepare(`SELECT last_failure_at FROM connection_sync_state
+    WHERE account_id = ?`).get(accountId) as { last_failure_at: string | null } | undefined;
+  if (failure?.last_failure_at) return true;
   const row = db.prepare("SELECT accepted_sync_at FROM accounts WHERE id = ?").get(accountId) as
-    | { accepted_sync_at: string | null }
-    | undefined;
+    | { accepted_sync_at: string | null } | undefined;
   if (!row?.accepted_sync_at) return true;
   return Date.now() - new Date(row.accepted_sync_at).getTime() >= ACCEPTED_SYNC_INTERVAL_MS;
 }
 
-interface ApiConnection {
-  vanity: string | null;
-  createdAt: number; // epoch ms
-}
-
-export async function syncAcceptedConnections(accountId: string): Promise<number> {
-  const db = getDb();
-  const page = await getSessionPage(accountId);
-  let stamped = 0;
-
-  try {
-    const boundaryRow = db.prepare("SELECT connections_synced_through_ms FROM accounts WHERE id = ?").get(accountId) as
-      | { connections_synced_through_ms: number | null }
-      | undefined;
-    const boundary = boundaryRow?.connections_synced_through_ms ?? null;
-    const isFullPass = boundary === null;
-    const stopBefore = boundary === null ? null : boundary - OVERLAP_MARGIN_MS;
-
-    // Read the declared total from the connections PAGE header (single nav, NO
-    // scroll). This is also our login-wall check and the completeness checksum.
-    await page.goto("https://www.linkedin.com/mynetwork/invite-connect/connections/", {
-      waitUntil: "domcontentloaded",
-      timeout: 35000,
-    });
-    await page.waitForTimeout(3500 + Math.random() * 1500);
-    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(page.url())) {
-      console.warn(`[sync-accepted] Session looks logged out (${page.url()}) — skipping`);
-      return 0;
-    }
-    const declaredTotal = await page.evaluate(() => {
-      const m = document.body.innerText.match(/([\d.,]+)\s+connections?/i);
-      return m ? parseInt(m[1].replace(/[.,]/g, ""), 10) : null;
-    });
-
-    const findByVanity = db.prepare(
-      `SELECT id, full_name, connected_at, degree FROM targets
-       WHERE linkedin_url LIKE ? AND connection_requested_at IS NOT NULL`
-    );
-    const stampAccepted = db.prepare(
-      "UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?"
-    );
-
-    const seenVanities = new Set<string>(); // full-pass phantom check
-    let uniquePulled = 0;
-    let newestSeen: number | null = null;
-    let reachedBoundary = false;
-
-    for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
-      const conns = await fetchConnectionsPage(page, pageIdx * PAGE_SIZE, PAGE_SIZE);
-      if (conns === null) {
-        console.warn(`[sync-accepted] connections API failed at start=${pageIdx * PAGE_SIZE} — stopping`);
-        break;
-      }
-      if (conns.length === 0) break; // end of list
-
-      for (const c of conns) {
-        uniquePulled++;
-        if (c.vanity) seenVanities.add(c.vanity);
-        if (newestSeen === null || c.createdAt > newestSeen) newestSeen = c.createdAt;
-
-        // Incremental early-exit (list is newest-first).
-        if (stopBefore !== null && c.createdAt < stopBefore) {
-          reachedBoundary = true;
-          break;
-        }
-        if (!c.vanity) continue;
-
-        for (const m of findByVanity.all(`%/in/${c.vanity}/%`) as Array<{
-          id: string; full_name: string | null; connected_at: string | null; degree: number | null;
-        }>) {
-          if (m.degree === 1 && m.connected_at) continue; // already correct
-          stampAccepted.run(msToSqlite(c.createdAt), m.id);
-          console.log(`[sync-accepted] Accepted: ${m.full_name ?? c.vanity}`);
-          stamped++;
-        }
-      }
-
-      if (reachedBoundary) break;
-      await page.waitForTimeout(900 + Math.random() * 700); // gentle, API-only
-    }
-
-    // Completeness checksum: a full pass is trustworthy only if what we pulled
-    // matches LinkedIn's own declared total (±5 slack for live churn).
-    const verifiedComplete =
-      isFullPass && declaredTotal !== null && Math.abs(uniquePulled - declaredTotal) <= 5;
-
-    // Correction: ONLY on a verified-complete full pass, un-mark phantom
-    // degree=1 contacts (present nowhere in the authoritative list). Never on an
-    // incremental/incomplete pass — a partial pull must not wipe real accepts.
-    let unmarked = 0;
-    if (verifiedComplete) {
-      const deg1 = db.prepare(
-        "SELECT id, full_name, linkedin_url FROM targets WHERE degree = 1 AND linkedin_url LIKE '%/in/%'"
-      ).all() as Array<{ id: string; full_name: string | null; linkedin_url: string }>;
-      const unmark = db.prepare("UPDATE targets SET degree = NULL, connected_at = NULL WHERE id = ?");
-      const tx = db.transaction((rows: typeof deg1) => {
-        for (const t of rows) {
-          const mm = t.linkedin_url.match(/\/in\/([^/?#]+)/);
-          const v = mm ? decodeURIComponent(mm[1]).toLowerCase() : null;
-          if (!v || !seenVanities.has(v)) {
-            unmark.run(t.id);
-            unmarked++;
-          }
-        }
-      });
-      tx(deg1);
-      console.log(`[sync-accepted] Verified full pass (pulled ${uniquePulled} == declared ${declaredTotal}). Un-marked ${unmarked} phantom degree=1.`);
-    } else if (isFullPass) {
-      console.warn(`[sync-accepted] Full pass NOT verified complete (pulled ${uniquePulled}, declared ${declaredTotal}) — add-only, no un-marking.`);
-    }
-
-    // Advance the boundary to the newest connection seen this run.
-    if (newestSeen !== null) {
-      db.prepare("UPDATE accounts SET connections_synced_through_ms = ? WHERE id = ?").run(newestSeen, accountId);
-    }
-    // Store the declared total for visibility (Settings shows LinkedIn's count).
-    if (declaredTotal !== null) {
-      db.prepare("UPDATE accounts SET li_connections = ? WHERE id = ?").run(declaredTotal, accountId);
-    }
-    console.log(`[sync-accepted] Stamped ${stamped} accepted, un-marked ${unmarked} phantom (boundary=${newestSeen}).`);
-  } finally {
-    // B5 safety: only persist the session if still on a valid page.
-    let url = "";
-    try { url = page.url(); } catch { /* gone */ }
-    try { await page.close(); } catch { /* ignore */ }
-    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(url)) {
-      console.warn(`[sync-accepted] Ended on a wall (${url}) — not persisting; flagging re-auth`);
-      try { await markNeedsReauth(accountId); } catch { /* ignore */ }
-    } else {
-      try { await saveSessionState(accountId); } catch { /* ignore */ }
-    }
-    db.prepare("UPDATE accounts SET accepted_sync_at = datetime('now') WHERE id = ?").run(accountId);
+/** Complete positive evidence only. Partial passes never write a success marker. */
+export async function syncAcceptedFromProvider(
+  db: Database.Database, accountId: string, provider: ConnectionProvider, stillOwnsLease?: () => boolean
+): Promise<number> {
+  db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Connections lease lost");
+    initRelationshipSchema(db);
+  }).immediate();
+  const declaredTotal = await provider.getDeclaredTotal();
+  if (declaredTotal === null || !Number.isSafeInteger(declaredTotal) || declaredTotal < 0) {
+    throw new Error("Connections total unavailable");
   }
 
-  return stamped;
+  const byProfile = new Map<string, ApiConnection>();
+  let reachedEnd = false;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const connections = await provider.getPage(page * PAGE_SIZE, PAGE_SIZE);
+    if (connections === null) throw new Error(`Connections API failed at start=${page * PAGE_SIZE}`);
+    if (connections.length === 0) {
+      reachedEnd = true;
+      break;
+    }
+    for (const connection of connections) {
+      if (!connection.profileId || !Number.isFinite(connection.createdAt)) {
+        throw new Error("Connections API returned incomplete profile evidence");
+      }
+      byProfile.set(connection.profileId, connection);
+    }
+  }
+  if (!reachedEnd || byProfile.size !== declaredTotal) {
+    throw new Error(`Incomplete connections pass: pulled ${byProfile.size}, declared ${declaredTotal}`);
+  }
+
+  const targets = db.prepare("SELECT id, linkedin_url FROM targets WHERE linkedin_url IS NOT NULL").all() as
+    Array<{ id: string; linkedin_url: string }>;
+  const targetsByVanity = new Map<string, string[]>();
+  for (const target of targets) {
+    const vanity = vanityFromUrl(target.linkedin_url);
+    if (!vanity) continue;
+    const ids = targetsByVanity.get(vanity) ?? [];
+    ids.push(target.id);
+    targetsByVanity.set(vanity, ids);
+  }
+  let recorded = 0;
+  db.transaction(() => {
+    if (stillOwnsLease && !stillOwnsLease()) throw new Error("Connections lease lost");
+    for (const connection of byProfile.values()) {
+      if (!connection.vanity) continue;
+      const ids = targetsByVanity.get(connection.vanity.toLowerCase()) ?? [];
+      for (const targetId of ids) {
+        recordConnectedEvidence(db, {
+          accountId, targetId, connectedAt: new Date(connection.createdAt).toISOString(),
+          source: "voyager_connections", profileId: connection.profileId,
+        });
+        recorded++;
+      }
+    }
+    db.prepare(`UPDATE accounts SET accepted_sync_at = datetime('now'),
+      connections_synced_through_ms = ?, li_connections = ? WHERE id = ?`).run(
+      Math.max(0, ...Array.from(byProfile.values(), (c) => c.createdAt)), declaredTotal, accountId);
+    db.prepare(`INSERT INTO connection_sync_state (account_id, last_failure_at, last_error)
+      VALUES (?, NULL, NULL) ON CONFLICT(account_id) DO UPDATE SET
+      last_failure_at = NULL, last_error = NULL`).run(accountId);
+  }).immediate();
+  return recorded;
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+export async function syncAcceptedConnections(accountId: string, stillOwnsLease?: () => boolean): Promise<number> {
+  const db = getDb();
+  let page: Page | undefined;
+  try {
+    const sessionPage = await getSessionPage(accountId);
+    page = sessionPage;
+    await sessionPage.goto("https://www.linkedin.com/mynetwork/invite-connect/connections/", {
+      waitUntil: "domcontentloaded", timeout: 35000,
+    });
+    await sessionPage.waitForTimeout(3500);
+    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(sessionPage.url())) {
+      if (!stillOwnsLease || stillOwnsLease()) await markNeedsReauth(accountId, stillOwnsLease);
+      throw new Error("LinkedIn session requires authentication");
+    }
+    const provider: ConnectionProvider = {
+      getDeclaredTotal: () => sessionPage.evaluate(() => {
+        const match = document.body.innerText.match(/([\d.,]+)\s+connections?/i);
+        return match ? Number(match[1].replace(/[.,]/g, "")) : null;
+      }),
+      getPage: (start, count) => fetchConnectionsPage(sessionPage, start, count),
+    };
+    const recorded = await syncAcceptedFromProvider(db, accountId, provider, stillOwnsLease);
+    if (!stillOwnsLease || stillOwnsLease()) await saveSessionState(accountId, stillOwnsLease);
+    return recorded;
+  } catch (error) {
+    db.transaction(() => {
+      if (!stillOwnsLease || stillOwnsLease()) {
+        initRelationshipSchema(db);
+        db.prepare(`INSERT INTO connection_sync_state (account_id, last_failure_at, last_error)
+      VALUES (?, datetime('now'), ?) ON CONFLICT(account_id) DO UPDATE SET
+      last_failure_at = excluded.last_failure_at, last_error = excluded.last_error`).run(
+          accountId, error instanceof Error ? error.message : String(error));
+      }
+    }).immediate();
+    throw error;
+  } finally {
+    const url = page?.url() ?? "";
+    await page?.close().catch(() => {});
+    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(url) && (!stillOwnsLease || stillOwnsLease())) {
+      await markNeedsReauth(accountId, stillOwnsLease).catch(() => {});
+    }
+  }
+}
 
-function msToSqlite(ms: number): string {
-  return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+function vanityFromUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "linkedin.com" && parsed.hostname !== "www.linkedin.com") return null;
+    const path = parsed.pathname.match(/^\/in\/([^/]+)\/?$/);
+    return path ? decodeURIComponent(path[1]).toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
 async function fetchConnectionsPage(page: Page, start: number, count: number): Promise<ApiConnection[] | null> {
-  return page.evaluate(
-    async ({ start, count, decoration }): Promise<ApiConnection[] | null> => {
-      const cookies = document.cookie.split("; ").reduce((a: Record<string, string>, c) => {
-        const i = c.indexOf("=");
-        if (i > 0) a[c.slice(0, i)] = c.slice(i + 1);
-        return a;
-      }, {});
-      const csrf = (cookies["JSESSIONID"] || "").replace(/"/g, "");
-      const url =
-        `https://www.linkedin.com/voyager/api/relationships/dash/connections` +
-        `?decorationId=${decoration}&count=${count}&q=search&sortType=RECENTLY_ADDED&start=${start}`;
-      let json: {
-        included?: Array<{
-          $type?: string;
-          entityUrn?: string;
-          createdAt?: number;
-          connectedMember?: string;
-          publicIdentifier?: string;
-        }>;
-      };
-      try {
-        const r = await fetch(url, {
-          headers: {
-            "csrf-token": csrf,
-            "accept": "application/vnd.linkedin.normalized+json+2.1",
-            "x-restli-protocol-version": "2.0.0",
-            "x-li-lang": "en_US",
-          },
-          credentials: "include",
-        });
-        if (!r.ok) return null;
-        json = await r.json();
-      } catch {
-        return null;
+  return page.evaluate(async ({ start, count, decoration }): Promise<ApiConnection[] | null> => {
+    const cookies = document.cookie.split("; ").reduce((all: Record<string, string>, item) => {
+      const index = item.indexOf("=");
+      if (index > 0) all[item.slice(0, index)] = item.slice(index + 1);
+      return all;
+    }, {});
+    const csrf = (cookies.JSESSIONID || "").replace(/"/g, "");
+    const url = `https://www.linkedin.com/voyager/api/relationships/dash/connections` +
+      `?decorationId=${decoration}&count=${count}&q=search&sortType=RECENTLY_ADDED&start=${start}`;
+    let json: { included?: Array<{
+      $type?: string; entityUrn?: string; createdAt?: number;
+      connectedMember?: string; publicIdentifier?: string;
+    }> };
+    try {
+      const response = await fetch(url, {
+        headers: {
+          "csrf-token": csrf, accept: "application/vnd.linkedin.normalized+json+2.1",
+          "x-restli-protocol-version": "2.0.0", "x-li-lang": "en_US",
+        },
+        credentials: "include",
+      });
+      if (!response.ok) return null;
+      json = await response.json();
+    } catch {
+      return null;
+    }
+    const included = json.included ?? [];
+    const vanityByUrn: Record<string, string> = {};
+    for (const item of included) {
+      if ((item.$type ?? "").includes("identity.profile.Profile") &&
+        item.entityUrn && item.publicIdentifier) {
+        vanityByUrn[item.entityUrn] = item.publicIdentifier;
       }
-
-      const included = json.included || [];
-      const vanityByUrn: Record<string, string> = {};
-      for (const x of included) {
-        if ((x.$type || "").includes("identity.profile.Profile") && x.entityUrn && x.publicIdentifier) {
-          vanityByUrn[x.entityUrn] = x.publicIdentifier;
-        }
-      }
-      const out: ApiConnection[] = [];
-      for (const x of included) {
-        if ((x.$type || "").includes("relationships.Connection") && typeof x.createdAt === "number") {
-          const memberUrn = x.connectedMember || null;
-          out.push({
-            createdAt: x.createdAt,
-            vanity: memberUrn ? vanityByUrn[memberUrn] ?? null : null,
-          });
-        }
-      }
-      out.sort((a, b) => b.createdAt - a.createdAt);
-      return out;
-    },
-    { start, count, decoration: DECORATION }
-  );
+    }
+    return included.filter((item) =>
+      (item.$type ?? "").includes("relationships.Connection") &&
+      typeof item.createdAt === "number" && !!item.connectedMember
+    ).map((item) => ({
+      profileId: item.connectedMember!, createdAt: item.createdAt!,
+      vanity: vanityByUrn[item.connectedMember!] ?? null,
+    }));
+  }, { start, count, decoration: DECORATION });
 }

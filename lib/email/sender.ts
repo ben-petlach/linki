@@ -1,5 +1,7 @@
 import nodemailer from "nodemailer";
 import Imap from "imap";
+import { randomUUID } from "crypto";
+import { createUnsubscribeUrl } from "@/lib/reliability/provider-health";
 
 export interface EmailAccount {
   id: string;
@@ -17,8 +19,9 @@ export async function sendEmail(
   account: EmailAccount,
   to: string,
   subject: string,
-  body: string
-): Promise<void> {
+  body: string,
+  options?: { messageId?: string; inReplyTo?: string; references?: string[]; unsubscribeActionKey?: string }
+): Promise<{ messageId: string; accepted: string[]; rejected: string[] }> {
   const transporter = nodemailer.createTransport({
     host: account.smtp_host,
     port: account.smtp_port,
@@ -27,18 +30,29 @@ export async function sendEmail(
       user: account.username,
       pass: account.password,
     },
-    // Allow self-signed certs (common in some corp SMTP setups)
-    tls: { rejectUnauthorized: false },
+    requireTLS: account.smtp_secure !== 1,
+    tls: { rejectUnauthorized: true },
   });
 
   const from = account.from_name
     ? `"${account.from_name}" <${account.from_email}>`
     : account.from_email;
 
-  await transporter.sendMail({
-    from, to, subject, text: body,
+  const messageId = options?.messageId ?? `<${randomUUID()}@${account.from_email.split("@")[1]}>`;
+  const unsubscribeUrl = options?.unsubscribeActionKey ? createUnsubscribeUrl(options.unsubscribeActionKey) : null;
+  const oneClickUrl = options?.unsubscribeActionKey ? createUnsubscribeUrl(options.unsubscribeActionKey, undefined, true) : null;
+  const text = unsubscribeUrl ? `${body}\n\nUnsubscribe: ${unsubscribeUrl}` : body;
+  const result = await transporter.sendMail({
+    from, to, subject, text, messageId,
+    ...(options?.inReplyTo ? { inReplyTo: options.inReplyTo } : {}),
+    ...(options?.references ? { references: options.references } : {}),
     ...(account.reply_to ? { replyTo: account.reply_to } : {}),
+    ...(oneClickUrl ? { headers: {
+      "List-Unsubscribe": `<${oneClickUrl}>`,
+      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    } } : {}),
   });
+  return { messageId: result.messageId, accepted: result.accepted.map(String), rejected: result.rejected.map(String) };
 }
 
 /**
@@ -52,7 +66,8 @@ export async function testSmtpConnection(account: Omit<EmailAccount, "id">): Pro
       port: account.smtp_port,
       secure: account.smtp_secure === 1,
       auth: { user: account.username, pass: account.password },
-      tls: { rejectUnauthorized: false },
+      requireTLS: account.smtp_secure !== 1,
+      tls: { rejectUnauthorized: true },
       connectionTimeout: 10_000,
       greetingTimeout: 10_000,
     });
@@ -82,7 +97,7 @@ export async function testImapConnection(account: ImapTestAccount): Promise<stri
       host: account.imap_host,
       port: account.imap_port,
       tls: true,
-      tlsOptions: { rejectUnauthorized: false },
+      tlsOptions: { rejectUnauthorized: true },
       user: account.imap_username ?? account.username,
       password: account.imap_password ?? account.password,
       authTimeout: 10_000,

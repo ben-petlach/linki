@@ -4,6 +4,16 @@ import { randomUUID } from "crypto";
 import { scheduleUpdateCheck } from "@/lib/update-check";
 import { encryptSecret, isEncrypted } from "@/lib/crypto";
 
+import { initActionSchema } from "@/lib/reliability/actions";
+import { initSuppressionSchema } from "@/lib/reliability/suppression";
+import { initEmailReliabilitySchema } from "@/lib/email/inbox";
+import { initLinkedInInboxSchema } from "@/lib/linkedin/inbox";
+import { initRelationshipSchema, initLegacyOutreachReview } from "@/lib/reliability/relationships";
+import { initInboxStateSchema } from "@/lib/reliability/inbox-state";
+import { initOperationsSchema } from "@/lib/reliability/operations";
+import { initProviderHealthSchema } from "@/lib/reliability/provider-health";
+import { initSchedulerSchema } from "@/lib/reliability/scheduler";
+
 const DB_PATH = process.env.LINKI_DB_PATH || path.join(process.cwd(), "linki.db");
 
 let db: Database.Database;
@@ -15,6 +25,16 @@ export function getDb(): Database.Database {
     db.pragma("foreign_keys = ON");
     initDb(db);
     runMigrations(db);
+    initRelationshipSchema(db);
+    initInboxStateSchema(db);
+    initActionSchema(db);
+    initSuppressionSchema(db);
+    initEmailReliabilitySchema(db);
+    initLinkedInInboxSchema(db);
+    initOperationsSchema(db);
+    initProviderHealthSchema(db);
+    initSchedulerSchema(db);
+    initLegacyOutreachReview(db);
     scheduleUpdateCheck();
   }
   return db;

@@ -11,6 +11,10 @@ data/
 scripts/*
 !scripts/mirror-ee.js
 !scripts/strip-mirrored-pages.js
+!scripts/start-server.mjs
+!scripts/backup-database.mjs
+!scripts/restore-database.mjs
+!scripts/container-smoke.mjs
 mcp/
 playwright-browsers/
 .env*

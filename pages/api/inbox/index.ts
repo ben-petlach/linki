@@ -84,19 +84,18 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       er.dispatch_result_json,
       COALESCE(er.manually_edited, 0) AS manually_edited
     FROM targets t
-    LEFT JOIN run_profiles rp ON rp.target_id = t.id
-    LEFT JOIN runs r ON r.id = rp.run_id AND r.status IN ('running', 'paused', 'completed')
+    LEFT JOIN email_replies er ON er.id = (
+      SELECT er2.id FROM email_replies er2 WHERE er2.target_id = t.id
+      ORDER BY er2.received_at DESC, er2.id DESC LIMIT 1
+    )
+    LEFT JOIN runs r ON r.id = COALESCE(er.run_id, (
+      SELECT rp2.run_id FROM run_profiles rp2 WHERE rp2.target_id = t.id
+      ORDER BY rp2.created_at DESC, rp2.id DESC LIMIT 1
+    ))
     LEFT JOIN workflows w ON w.id = r.workflow_id
-    LEFT JOIN email_accounts ea ON ea.id = rp.email_account_id
-    LEFT JOIN (
-      SELECT er1.* FROM email_replies er1
-      WHERE er1.received_at = (
-        SELECT MAX(er2.received_at) FROM email_replies er2 WHERE er2.target_id = er1.target_id
-      )
-    ) er ON er.target_id = t.id
+    LEFT JOIN email_accounts ea ON ea.id = er.email_account_id
     WHERE 1=1
     ${channelFilter}
-    GROUP BY t.id
     ORDER BY replied_at DESC
   `).all() as Array<InboxReply & { classification_json: string | null }>;
 

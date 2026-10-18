@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
+import { evaluateEligibility } from "@/lib/reliability/suppression";
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   const db = getDb();
@@ -86,7 +87,13 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       ).all() as { target_id: string }[]).map((r) => r.target_id)
     );
 
-    const targets = candidates.filter((t) => !alreadyEnrolled.has(t.target_id) && !activeElsewhere.has(t.target_id));
+    const suppression_blocks: Array<{ target_id: string; blocks: ReturnType<typeof evaluateEligibility>["blocks"] }> = [];
+    const targets = [...new Set(candidates.map((t) => t.target_id))].map((target_id) => ({ target_id })).filter((t) => {
+      if (alreadyEnrolled.has(t.target_id) || activeElsewhere.has(t.target_id)) return false;
+      const verdict = evaluateEligibility(db, t.target_id, { netNew: true });
+      if (!verdict.allowed) suppression_blocks.push({ target_id: t.target_id, blocks: verdict.blocks });
+      return verdict.allowed;
+    });
 
     if (targets.length === 0) {
       // Clean up the run we just created since there's nothing to enroll
@@ -94,12 +101,13 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       return res.status(400).json({
         error: "all_already_enrolled",
         message: "All selected contacts are already enrolled in this workflow.",
+        suppression_blocks,
       });
     }
 
     // Assign email accounts: company-grouped round-robin
     // All targets at the same company get the same sender; companies cycle through the pool
-    let emailAssignment: Map<string, string | null> = new Map();
+    const emailAssignment: Map<string, string | null> = new Map();
     if (emailAccountPool.length > 0) {
       // Load company_id for each candidate target
       const targetIds = targets.map(t => t.target_id);
@@ -139,8 +147,16 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     const insertTrack = db.prepare(
       "INSERT INTO run_profile_tracks (id, run_profile_id, track, state, current_step) VALUES (?, ?, ?, 'pending', 0)"
     );
+    let enrolled = 0;
     const insertMany = db.transaction((ts: { target_id: string }[]) => {
       for (const t of ts) {
+        const verdict = evaluateEligibility(db, t.target_id, { netNew: true });
+        if (!verdict.allowed) { suppression_blocks.push({ target_id: t.target_id, blocks: verdict.blocks }); continue; }
+        const duplicate = db.prepare(`SELECT 1 FROM run_profiles rp JOIN runs r ON r.id = rp.run_id
+          WHERE rp.target_id = ? AND rp.run_id != ? AND (r.workflow_id = ? OR (r.status IN ('running', 'paused')
+          AND EXISTS (SELECT 1 FROM run_profile_tracks rt WHERE rt.run_profile_id = rp.id
+          AND rt.state NOT IN ('completed', 'failed', 'skipped')))) LIMIT 1`).get(t.target_id, runId, workflow_id);
+        if (duplicate) continue;
         const assignedEmailAccountId = emailAssignment.get(t.target_id) ?? null;
         const rpId = randomUUID();
         insertProfile.run(rpId, runId, t.target_id, assignedEmailAccountId);
@@ -149,11 +165,17 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
           if (track === "email" && !assignedEmailAccountId) continue;
           insertTrack.run(randomUUID(), rpId, track);
         }
+        enrolled++;
       }
     });
-    insertMany(targets);
+    insertMany.immediate(targets);
 
-    return res.status(201).json({ id: runId });
+    if (enrolled === 0) {
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      return res.status(400).json({ error: "no_eligible_contacts", suppression_blocks });
+    }
+
+    return res.status(201).json({ id: runId, enrolled, suppression_blocks });
   }
 
   res.status(405).end();
