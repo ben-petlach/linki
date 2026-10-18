@@ -32,7 +32,7 @@ export async function sendDirectEmail(db: Database.Database, input: {
       payloadHash: createHash("sha256").update(input.subject + "\0" + input.body + "\0" + (input.inReplyTo ?? "") + "\0" + (input.references ?? []).join(" ")).digest("hex") });
     const begun = beginDispatch(db, key, token, () => gate(db, input.targetId, input.account.id, input.recipient, key, true, input.replyId, input.inReplyTo));
     if (!begun.started) {
-      if (releaseClaim(db, key, token)) db.prepare("DELETE FROM email_outbound WHERE action_key = ? AND accepted_at IS NULL").run(key);
+      releaseUnsentRegistration(db, key, token);
       return { ok: false, status: 409, error: begun.reason ?? "Send blocked" };
     }
     started = true;
@@ -47,12 +47,20 @@ export async function sendDirectEmail(db: Database.Database, input: {
     return { ok: true, messageId: result.messageId };
   } catch (err) {
     if (!started) {
-      if (releaseClaim(db, key, token)) db.prepare("DELETE FROM email_outbound WHERE action_key = ? AND accepted_at IS NULL").run(key);
+      releaseUnsentRegistration(db, key, token);
       return { ok: false, status: 409, error: err instanceof Error ? err.message : String(err) };
     }
     holdUnknown(db, key, token, err instanceof Error ? err.message : String(err));
     return { ok: false, status: 502, error: "Send outcome uncertain; held for review" };
   }
+}
+
+function releaseUnsentRegistration(db: Database.Database, key: string, token: string): void {
+  db.transaction(() => {
+    if (releaseClaim(db, key, token)) {
+      db.prepare("DELETE FROM email_outbound WHERE action_key = ? AND accepted_at IS NULL").run(key);
+    }
+  }).immediate();
 }
 
 function gate(db: Database.Database, targetId: string, accountId: string, recipient: string, actionKey: string, registered: boolean, replyId?: string, inReplyTo?: string): string | null {
