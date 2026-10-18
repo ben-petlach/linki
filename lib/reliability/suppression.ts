@@ -108,12 +108,47 @@ export function preserveSuppressionBeforeEmailUpdate(db: DB, targetId: string, n
   for (const rule of rules) suppressTarget(db, targetId, rule.reason, rule.evidence);
 }
 
+function tableExists(db: DB, table: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+}
+
+function outreachHistory(db: DB, targetId: string): { evidence: string; at: string } | null {
+  const legacy = db.prepare(`SELECT COALESCE(message_sent_at, inmail_sent_at, connection_requested_at,
+    last_replied_at, email_replied_at) AS at FROM targets WHERE id = ?
+    AND (message_sent_at IS NOT NULL OR inmail_sent_at IS NOT NULL OR connection_requested_at IS NOT NULL
+      OR last_replied_at IS NOT NULL OR email_replied_at IS NOT NULL)`).get(targetId) as { at: string } | undefined;
+  if (legacy) return { evidence: `target:${targetId}:${legacy.at}`, at: legacy.at };
+
+  if (tableExists(db, "dispatch_actions")) {
+    const action = db.prepare(`SELECT action_key, state, COALESCE(dispatched_at, created_at) AS at
+      FROM dispatch_actions WHERE target_id = ?
+      AND channel IN ('connect', 'message', 'email', 'sales_inmail')
+      AND state IN ('sending', 'confirmed', 'unknown')
+      ORDER BY created_at LIMIT 1`).get(targetId) as { action_key: string; state: string; at: string } | undefined;
+    if (action) return { evidence: `dispatch_action:${action.action_key}:${action.state}`, at: action.at };
+  }
+
+  if (tableExists(db, "email_outbound")) {
+    const email = db.prepare(`SELECT action_key, accepted_at FROM email_outbound
+      WHERE target_id = ? AND accepted_at IS NOT NULL ORDER BY accepted_at LIMIT 1`)
+      .get(targetId) as { action_key: string; accepted_at: string } | undefined;
+    if (email) return { evidence: `email_outbound:${email.action_key}:${email.accepted_at}`, at: email.accepted_at };
+  }
+  if (tableExists(db, "account_target_state")) {
+    const invitation = db.prepare(`SELECT account_id, connection_requested_at FROM account_target_state
+      WHERE target_id = ? AND connection_requested_at IS NOT NULL ORDER BY connection_requested_at LIMIT 1`)
+      .get(targetId) as { account_id: string; connection_requested_at: string } | undefined;
+    if (invitation) return { evidence: `invitation:${invitation.account_id}:${invitation.connection_requested_at}`, at: invitation.connection_requested_at };
+  }
+  return null;
+}
+
 // Keep historical outreach and explicit exclusions when a target row is removed.
 // Sourced-only rows remain eligible after reimport.
 export function preserveTargetSuppressionOnDelete(db: DB, targetId: string): void {
   initSuppressionSchema(db);
   const target = db.prepare(`SELECT id, email, linkedin_url, message_sent_at, inmail_sent_at,
-    connection_requested_at, last_replied_at, email_replied_at FROM targets WHERE id = ?`)
+    connection_requested_at, last_replied_at, email_replied_at, company_id FROM targets WHERE id = ?`)
     .get(targetId) as Record<string, string | null> | undefined;
   if (!target) return;
   db.transaction(() => {
@@ -123,10 +158,12 @@ export function preserveTargetSuppressionOnDelete(db: DB, targetId: string): voi
       if (target.email) suppressIdentity(db, { ...block, kind: "email", value: target.email });
       if (target.linkedin_url) suppressIdentity(db, { ...block, kind: "linkedin", value: target.linkedin_url });
     }
-    const historical = target.message_sent_at || target.inmail_sent_at || target.connection_requested_at || target.last_replied_at || target.email_replied_at;
+    const historical = outreachHistory(db, targetId);
     if (historical) {
-      if (target.email) suppressIdentity(db, { kind: "email", value: target.email, reason: "previously_contacted", evidence: `deleted_target:${targetId}`, scope: "net_new" });
-      if (target.linkedin_url) suppressIdentity(db, { kind: "linkedin", value: target.linkedin_url, reason: "previously_contacted", evidence: `deleted_target:${targetId}`, scope: "net_new" });
+      const input = { reason: "previously_contacted", evidence: `deleted_target:${targetId}:${historical.evidence}`, scope: "net_new" as const };
+      if (target.email) suppressIdentity(db, { ...input, kind: "email", value: target.email });
+      if (target.linkedin_url) suppressIdentity(db, { ...input, kind: "linkedin", value: target.linkedin_url });
+      if (target.company_id) suppressIdentity(db, { ...input, kind: "company", value: target.company_id });
     }
   })();
 }
@@ -172,20 +209,22 @@ export function evaluateEligibility(
   }
   const relevant = blocks.filter((block) => block.reason !== "hard_bounce" || options.channel !== "linkedin");
   if (options.netNew) {
-    const history = db.prepare(`SELECT id, COALESCE(message_sent_at, inmail_sent_at, connection_requested_at,
-      last_replied_at, email_replied_at) AS contacted_at FROM targets
-      WHERE (id = ? OR (company_id IS NOT NULL AND company_id = ?))
-      AND (message_sent_at IS NOT NULL OR inmail_sent_at IS NOT NULL OR connection_requested_at IS NOT NULL
-        OR last_replied_at IS NOT NULL OR email_replied_at IS NOT NULL)
-      ORDER BY contacted_at LIMIT 1`).get(targetId, target.company_id) as { id: string; contacted_at: string } | undefined;
-    if (history) relevant.push({
-      kind: history.id === targetId ? "target" : "company",
-      value: history.id === targetId ? targetId : target.company_id!,
-      reason: "previously_contacted",
-      evidence: `target:${history.id}:${history.contacted_at}`,
-      scope: "net_new",
-      created_at: history.contacted_at,
-    });
+    const members = target.company_id
+      ? db.prepare("SELECT id FROM targets WHERE id = ? OR company_id = ?").all(targetId, target.company_id) as { id: string }[]
+      : [{ id: targetId }];
+    for (const member of members) {
+      const history = outreachHistory(db, member.id);
+      if (!history) continue;
+      relevant.push({
+        kind: member.id === targetId ? "target" : "company",
+        value: member.id === targetId ? targetId : target.company_id!,
+        reason: "previously_contacted",
+        evidence: history.evidence,
+        scope: "net_new",
+        created_at: history.at,
+      });
+      break;
+    }
   }
   return { allowed: relevant.length === 0, blocks: relevant };
 }

@@ -13,6 +13,10 @@ function fixture() {
       city TEXT, country TEXT, phone TEXT, headline TEXT, summary TEXT, notes TEXT, sales_nav_url TEXT,
       message_sent_at TEXT, inmail_sent_at TEXT, connection_requested_at TEXT, last_replied_at TEXT, email_replied_at TEXT);
     CREATE TABLE list_targets (list_id TEXT, target_id TEXT, UNIQUE(list_id, target_id));
+    CREATE TABLE dispatch_actions (action_key TEXT PRIMARY KEY, state TEXT, dispatched_at TEXT,
+      sender_id TEXT, target_id TEXT, channel TEXT, created_at TEXT);
+    CREATE TABLE email_outbound (action_key TEXT PRIMARY KEY, target_id TEXT, accepted_at TEXT);
+    CREATE TABLE account_target_state (account_id TEXT, target_id TEXT, connection_requested_at TEXT);
     INSERT INTO companies VALUES ('c1', 'Example.com'), ('c2', 'other.com');
     INSERT INTO targets (id, linkedin_url, email, company_id, full_name) VALUES
       ('t1', 'https://www.linkedin.com/in/jane', 'Jane@Example.com', 'c1', 'Jane Smith'),
@@ -65,6 +69,39 @@ test("existing outreach history excludes person and verified company from net-ne
   assert.equal(peer.blocks[0].evidence, "target:t1:2026-01-02");
   assert.equal(evaluateEligibility(db, "t3", { netNew: true }).allowed, true);
   assert.equal(evaluateEligibility(db, "t2", { netNew: false }).allowed, true);
+  db.close();
+});
+
+test("new dispatch, SMTP, and scoped invitation evidence exclude net-new without blocking followups", () => {
+  const db = fixture();
+  db.prepare(`INSERT INTO dispatch_actions VALUES ('claimed-1', 'claimed', NULL, 'a1', 't1', 'email', '2026-01-01')`).run();
+  assert.equal(evaluateEligibility(db, "t2", { netNew: true }).allowed, true);
+  db.prepare(`INSERT INTO dispatch_actions VALUES ('send-1', 'sending', '2026-01-02', 'a1', 't1', 'email', '2026-01-02')`).run();
+  const verdict = evaluateEligibility(db, "t2", { netNew: true });
+  assert.equal(verdict.allowed, false);
+  assert.equal(verdict.blocks[0].evidence, "dispatch_action:send-1:sending");
+  assert.equal(evaluateEligibility(db, "t2", { checkNetNewRules: true }).allowed, true);
+  db.prepare(`INSERT INTO email_outbound VALUES ('smtp-1', 't3', '2026-01-03')`).run();
+  assert.equal(evaluateEligibility(db, "t3", { netNew: true }).blocks[0].evidence, "email_outbound:smtp-1:2026-01-03");
+  db.prepare(`DELETE FROM email_outbound WHERE action_key = 'smtp-1'`).run();
+  db.prepare(`INSERT INTO dispatch_actions VALUES ('unknown-1', 'unknown', '2026-01-03', 'a1', 't3', 'message', '2026-01-03')`).run();
+  assert.equal(evaluateEligibility(db, "t3", { netNew: true }).blocks[0].evidence, "dispatch_action:unknown-1:unknown");
+  db.prepare(`DELETE FROM dispatch_actions WHERE action_key = 'send-1'`).run();
+  db.prepare(`INSERT INTO account_target_state VALUES ('a2', 't1', '2026-01-04')`).run();
+  assert.equal(evaluateEligibility(db, "t2", { netNew: true }).blocks[0].evidence, "invitation:a2:2026-01-04");
+  db.close();
+});
+
+test("deleting sole contacted employee keeps company and domain history for fresh employees", () => {
+  const db = fixture();
+  db.prepare(`INSERT INTO dispatch_actions VALUES ('send-1', 'confirmed', '2026-01-02', 'a1', 't1', 'message', '2026-01-02')`).run();
+  preserveTargetSuppressionOnDelete(db, "t1");
+  db.prepare("DELETE FROM targets WHERE id = 't1'").run();
+  db.prepare("INSERT INTO targets (id, linkedin_url, email, company_id) VALUES ('fresh', 'https://www.linkedin.com/in/fresh', 'fresh@example.com', 'c1')").run();
+  db.prepare("INSERT INTO targets (id, linkedin_url, email) VALUES ('email-only', 'https://www.linkedin.com/in/email-only', 'other@example.com')").run();
+  assert.equal(evaluateEligibility(db, "fresh", { netNew: true }).allowed, false);
+  assert.equal(evaluateEligibility(db, "email-only", { netNew: true }).allowed, false);
+  assert.equal(evaluateEligibility(db, "t3", { netNew: true }).allowed, true);
   db.close();
 });
 
