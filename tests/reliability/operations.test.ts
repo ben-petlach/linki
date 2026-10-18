@@ -1,12 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import { encode } from "next-auth/jwt";
+import type { NextApiRequest, NextApiResponse } from "next";
 import { beginDispatch, claimAction, getAction, holdUnknown, initActionSchema } from "../../lib/reliability/actions";
 import { initInboxStateSchema } from "../../lib/reliability/inbox-state";
 import {
   evaluateOperationAlerts, getDispatchBlockReason, getGlobalDispatchControl, getOperationMetrics,
   initOperationsSchema, listOperationAlerts, recordWorkerHeartbeat, reviewHeldAction, setGlobalDispatchPause,
 } from "../../lib/reliability/operations";
+import { isSameOriginMutation } from "../../lib/reliability/operations-auth";
+import pauseHandler from "../../pages/api/operations/pause";
+import reviewHandler from "../../pages/api/operations/actions/[actionKey]/review";
+import { getDb } from "../../lib/db";
 
 function database(): Database.Database {
   const db = new Database(":memory:");
@@ -44,10 +50,11 @@ test("global pause persists and is audited; outbound final gate blocks while inb
     setGlobalDispatchPause(db, { paused: false, actorId: "operator", reason: "provider healthy" });
     assert.equal(getDispatchBlockReason(db), null);
     assert.equal(getGlobalDispatchControl(db).paused, false);
-    const audit = db.prepare("SELECT kind, actor_id, reason FROM operation_audit ORDER BY created_at").all() as
-      Array<{ kind: string; actor_id: string; reason: string }>;
+    const audit = db.prepare("SELECT kind, actor_id, reason, before_state, after_state FROM operation_audit ORDER BY rowid").all() as
+      Array<{ kind: string; actor_id: string; reason: string; before_state: string; after_state: string }>;
     assert.deepEqual(audit.map(row => row.kind).sort(), ["global_pause", "global_resume"]);
     assert.ok(audit.every(row => row.actor_id === "operator" && row.reason));
+    assert.deepEqual(audit.map(row => [row.before_state, row.after_state]), [["running", "paused"], ["paused", "running"]]);
   } finally { db.close(); }
 });
 
@@ -95,6 +102,24 @@ test("alert sink deduplicates held, inbox, and worker faults then resolves recov
   } finally { db.close(); }
 });
 
+test("verified account with no inbox scan alerts; LinkedIn cadence does not flap at 16 minutes", () => {
+  const db = database();
+  try {
+    db.exec("CREATE TABLE email_accounts (id TEXT PRIMARY KEY, is_verified INTEGER NOT NULL);");
+    db.exec("CREATE TABLE accounts (id TEXT PRIMARY KEY, is_authenticated INTEGER NOT NULL);");
+    db.prepare("INSERT INTO email_accounts (id, is_verified) VALUES ('mail', 1)").run();
+    db.prepare("INSERT INTO accounts (id, is_authenticated) VALUES ('li', 1)").run();
+    const at = "2026-10-18T13:00:00.000Z";
+    recordWorkerHeartbeat(db, "scheduler", at);
+    evaluateOperationAlerts(db, { now: at });
+    assert.deepEqual(listOperationAlerts(db).map(alert => alert.subject_id).sort(), ["email:mail", "linkedin:li"]);
+    db.prepare(`INSERT INTO inbox_sync_state (account_id, channel, last_successful_at)
+      VALUES ('mail','email',?), ('li','linkedin',?)`).run(at, "2026-10-18T12:44:00.000Z");
+    evaluateOperationAlerts(db, { now: at });
+    assert.equal(listOperationAlerts(db).length, 0);
+  } finally { db.close(); }
+});
+
 test("metrics come from durable actions and inbound events; logs and claims do not inflate sends", () => {
   const db = database();
   try {
@@ -111,4 +136,64 @@ test("metrics come from durable actions and inbound events; logs and claims do n
       attempted: 1, confirmed: 0, emailAccepted: 1, replied: 2, bounced: 1, unsubscribed: 1, unknown: 1,
     });
   } finally { db.close(); }
+});
+
+test("operator pause API requires signed session and same origin; actor comes from session", async () => {
+  const db = getDb();
+  db.prepare("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
+    .run("operator-api", "operator-api@example.test", "synthetic-hash");
+  const token = await encode({ token: { sub: "operator-api", email: "operator-api@example.test" },
+    secret: process.env.NEXTAUTH_SECRET!, maxAge: 60 });
+  const cookie = `next-auth.session-token=${token}`;
+  const key = "operator-api:review";
+  hold(db, key);
+  function request(origin: string | undefined, cookieValue: string | undefined): NextApiRequest {
+    const headers: Record<string, string> = { host: "localhost:3000" };
+    if (origin) headers.origin = origin;
+    if (cookieValue) headers.cookie = cookieValue;
+    return { method: "POST", headers, cookies: cookieValue ? { "next-auth.session-token": token } : {},
+      body: { paused: true, reason: "synthetic test", actorId: "forged-client-id" } } as unknown as NextApiRequest;
+  }
+  function response() {
+    let code = 200;
+    let body: unknown;
+    const headers: Record<string, string | string[]> = {};
+    const res = {
+      status(value: number) { code = value; return res; },
+      json(value: unknown) { body = value; return res; },
+      end() { return res; },
+      setHeader(key: string, value: string | string[]) { headers[key.toLowerCase()] = value; return res; },
+      getHeader(key: string) { return headers[key.toLowerCase()]; },
+    } as unknown as NextApiResponse;
+    return { res, get code() { return code; }, get body() { return body; } };
+  }
+  assert.equal(isSameOriginMutation(request("https://evil.example", cookie)), false);
+  const unauth = response();
+  await pauseHandler(request("http://localhost:3000", undefined), unauth.res);
+  assert.equal(unauth.code, 401);
+  const cross = response();
+  await pauseHandler(request("https://evil.example", cookie), cross.res);
+  assert.equal(cross.code, 403);
+  const same = response();
+  await pauseHandler(request("http://localhost:3000", cookie), same.res);
+  assert.equal(same.code, 200);
+  const audit = db.prepare("SELECT actor_id FROM operation_audit WHERE kind = 'global_pause' ORDER BY rowid DESC LIMIT 1")
+    .get() as { actor_id: string };
+  assert.equal(audit.actor_id, "operator-api");
+
+  const reviewRequest = (origin: string | undefined, cookieValue: string | undefined) => {
+    const req = request(origin, cookieValue);
+    req.query = { actionKey: key };
+    req.body = { decision: "note", reason: "provider not yet confirmed", evidence: "checked durable ledger", actorId: "forged-client-id" };
+    return req;
+  };
+  const badReview = response();
+  await reviewHandler(reviewRequest("https://evil.example", cookie), badReview.res);
+  assert.equal(badReview.code, 403);
+  const validReview = response();
+  await reviewHandler(reviewRequest("http://localhost:3000", cookie), validReview.res);
+  assert.equal(validReview.code, 200);
+  const reviewAudit = db.prepare("SELECT actor_id, before_state, after_state FROM operation_audit WHERE action_key = ?")
+    .get(key) as { actor_id: string; before_state: string; after_state: string };
+  assert.deepEqual(reviewAudit, { actor_id: "operator-api", before_state: "unknown", after_state: "unknown" });
 });

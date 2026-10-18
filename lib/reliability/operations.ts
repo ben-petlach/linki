@@ -37,6 +37,8 @@ export function initOperationsSchema(db: Db): void {
       actor_id TEXT NOT NULL,
       reason TEXT NOT NULL,
       evidence TEXT,
+      before_state TEXT,
+      after_state TEXT,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_operation_audit_action ON operation_audit(action_key, created_at);
@@ -55,6 +57,9 @@ export function initOperationsSchema(db: Db): void {
       resolved_at TEXT
     );
   `);
+  const auditColumns = db.prepare("PRAGMA table_info(operation_audit)").all() as Array<{ name: string }>;
+  if (!auditColumns.some(column => column.name === "before_state")) db.exec("ALTER TABLE operation_audit ADD COLUMN before_state TEXT");
+  if (!auditColumns.some(column => column.name === "after_state")) db.exec("ALTER TABLE operation_audit ADD COLUMN after_state TEXT");
   db.prepare("INSERT OR IGNORE INTO operation_worker_health (worker_kind, last_heartbeat_at) VALUES ('scheduler', NULL)").run();
 }
 
@@ -76,14 +81,17 @@ export function setGlobalDispatchPause(db: Db, input: { paused: boolean; actorId
   const now = input.now ?? new Date().toISOString();
   initOperationsSchema(db);
   db.transaction(() => {
+    const before = getGlobalDispatchControl(db).paused ? "paused" : "running";
+    const after = input.paused ? "paused" : "running";
     db.prepare(`INSERT INTO global_dispatch_control (id, paused, reason, updated_by, updated_at)
       VALUES (1, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET paused = excluded.paused, reason = excluded.reason,
         updated_by = excluded.updated_by, updated_at = excluded.updated_at`)
       .run(input.paused ? 1 : 0, reason, input.actorId, now);
-    db.prepare(`INSERT INTO operation_audit (id, action_key, kind, actor_id, reason, evidence, created_at)
-      VALUES (?, NULL, ?, ?, ?, NULL, ?)`)
-      .run(randomUUID(), input.paused ? "global_pause" : "global_resume", input.actorId, reason, now);
+    db.prepare(`INSERT INTO operation_audit
+      (id, action_key, kind, actor_id, reason, evidence, before_state, after_state, created_at)
+      VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?)`)
+      .run(randomUUID(), input.paused ? "global_pause" : "global_resume", input.actorId, reason, before, after, now);
   }).immediate();
 }
 
@@ -131,9 +139,11 @@ export function reviewHeldAction(db: Db, input: {
       if (result.changes !== 1) throw new Error("Action changed during review");
       confirmed = true;
     }
-    db.prepare(`INSERT INTO operation_audit (id, action_key, kind, actor_id, reason, evidence, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(randomUUID(), input.actionKey, confirmed ? "provider_reconciled" : "review_note", input.actorId, reason, evidence, now);
+    db.prepare(`INSERT INTO operation_audit
+      (id, action_key, kind, actor_id, reason, evidence, before_state, after_state, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(randomUUID(), input.actionKey, confirmed ? "provider_reconciled" : "review_note",
+        input.actorId, reason, evidence, action.state, confirmed ? "confirmed" : action.state, now);
     return { confirmed, reason: confirmed ? "Provider acceptance reconciled without resend" : "Action remains held" };
   }).immediate();
 }
@@ -183,9 +193,25 @@ export function evaluateOperationAlerts(db: Db, input: { now?: string; workerMax
   }
   const inboxes = db.prepare("SELECT account_id, channel, last_successful_at, last_failure_at FROM inbox_sync_state").all() as
     Array<{ account_id: string; channel: string; last_successful_at: string | null; last_failure_at: string | null }>;
-  for (const inbox of inboxes) {
+  const expected = new Map(inboxes.map(inbox => [`${inbox.channel}:${inbox.account_id}`, inbox]));
+  const tableExists = (name: string) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+  if (tableExists("email_accounts")) {
+    const rows = db.prepare("SELECT id FROM email_accounts WHERE is_verified = 1").all() as Array<{ id: string }>;
+    for (const row of rows) if (!expected.has(`email:${row.id}`)) {
+      expected.set(`email:${row.id}`, { account_id: row.id, channel: "email", last_successful_at: null, last_failure_at: null });
+    }
+  }
+  if (tableExists("accounts")) {
+    const rows = db.prepare("SELECT id FROM accounts WHERE is_authenticated = 1").all() as Array<{ id: string }>;
+    for (const row of rows) if (!expected.has(`linkedin:${row.id}`)) {
+      expected.set(`linkedin:${row.id}`, { account_id: row.id, channel: "linkedin", last_successful_at: null, last_failure_at: null });
+    }
+  }
+  for (const inbox of expected.values()) {
     const successMs = Date.parse(inbox.last_successful_at ?? "");
-    const maxAge = inbox.channel === "email" ? (input.emailMaxAgeMs ?? 5 * 60_000) : (input.linkedinMaxAgeMs ?? 10 * 60_000);
+    // LinkedIn polling is due every 15 minutes; allow one missed interval
+    // before alerting, while final send gates apply their stricter freshness.
+    const maxAge = inbox.channel === "email" ? (input.emailMaxAgeMs ?? 5 * 60_000) : (input.linkedinMaxAgeMs ?? 30 * 60_000);
     if (!Number.isFinite(successMs) || successMs > nowMs + 60_000 || nowMs - successMs > maxAge || inbox.last_failure_at) {
       const key = `inbox:${inbox.channel}:${inbox.account_id}`;
       wanted.set(key, { kind: "inbox_stale", subjectId: `${inbox.channel}:${inbox.account_id}`,

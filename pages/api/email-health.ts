@@ -14,25 +14,26 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     daily_email_limit: number; ramp_up_enabled: number; ramp_start_date: string | null;
   }[];
 
-  // Sent per account per day for the last 7 days
+  // Count only durable SMTP acceptance. Legacy free-text logs can be duplicated
+  // or record attempts whose provider outcome was never established.
   const dailySends = db.prepare(`
-    SELECT rp.email_account_id,
-           date(l.created_at) as day,
+    SELECT o.email_account_id,
+           date(o.accepted_at) as day,
            COUNT(*) as sent
-    FROM logs l
-    JOIN run_profiles rp ON rp.run_id = l.run_id AND rp.target_id = l.target_id
-    WHERE l.message LIKE 'Email sent%'
-    AND l.created_at >= date('now', '-6 days')
-    GROUP BY rp.email_account_id, date(l.created_at)
+    FROM email_outbound o
+    WHERE o.accepted_at IS NOT NULL
+      AND o.accepted_at >= date('now', '-6 days')
+    GROUP BY o.email_account_id, date(o.accepted_at)
   `).all() as { email_account_id: string; day: string; sent: number }[];
 
-  // Last 50 email send log entries across all accounts
+  // Last 50 durable provider acceptances across all accounts.
   const recentLogs = db.prepare(`
-    SELECT l.created_at, l.message, rp.email_account_id
-    FROM logs l
-    JOIN run_profiles rp ON rp.run_id = l.run_id AND rp.target_id = l.target_id
-    WHERE l.message LIKE 'Email sent%'
-    ORDER BY l.created_at DESC
+    SELECT o.accepted_at AS created_at,
+           'SMTP accepted: ' || o.recipient_email AS message,
+           o.email_account_id
+    FROM email_outbound o
+    WHERE o.accepted_at IS NOT NULL
+    ORDER BY o.accepted_at DESC
     LIMIT 50
   `).all() as { created_at: string; message: string; email_account_id: string }[];
 
