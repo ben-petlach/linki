@@ -174,7 +174,8 @@ export function initLegacyOutreachReview(db: Database.Database): number {
       FROM runs r JOIN run_profiles rp ON rp.run_id = r.id
       JOIN targets t ON t.id = rp.target_id
       WHERE r.status IN ('running', 'paused') AND (
-        t.message_sent_at IS NOT NULL OR t.connection_requested_at IS NOT NULL
+        r.started_at IS NOT NULL
+        OR t.message_sent_at IS NOT NULL OR t.connection_requested_at IS NOT NULL
         OR t.email_replied_at IS NOT NULL OR t.email_status = 'sent'
         OR EXISTS (SELECT 1 FROM logs l WHERE l.run_id = r.id
           AND l.target_id = rp.target_id AND l.message LIKE 'Email sent%')
