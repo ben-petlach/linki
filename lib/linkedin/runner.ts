@@ -1077,6 +1077,35 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
     seenAccounts.add(run.account_id);
   }
 
+  const activeRunIds = activeRuns.map(r => r.run_id);
+  const activeReplyInboxes = db.prepare(`
+    WITH active_targets AS (
+      SELECT DISTINCT target_id FROM run_profiles WHERE run_id IN (${activeRunIds.map(() => "?").join(",")})
+    )
+    SELECT DISTINCT rt.track AS channel,
+      CASE rt.track WHEN 'linkedin' THEN r.account_id ELSE rp.email_account_id END AS sender_id
+    FROM run_profile_tracks rt
+    JOIN run_profiles rp ON rp.id = rt.run_profile_id
+    JOIN runs r ON r.id = rp.run_id
+    JOIN active_targets a ON a.target_id = rp.target_id
+    WHERE rt.state IN ('pending','in_progress')
+      OR EXISTS (SELECT 1 FROM logs l WHERE l.run_id = rp.run_id AND l.target_id = rp.target_id
+        AND ((rt.track = 'email' AND l.message LIKE 'Email sent%')
+          OR (rt.track = 'linkedin' AND (
+            l.message LIKE 'Connection request sent%' OR l.message LIKE 'Message sent%' OR l.message LIKE 'InMail sent%'))))
+    UNION
+    SELECT DISTINCT CASE WHEN da.channel = 'email' THEN 'email' ELSE 'linkedin' END AS channel,
+      da.sender_id AS sender_id
+    FROM dispatch_actions da
+    JOIN active_targets a ON a.target_id = da.target_id
+    WHERE da.channel IN ('email','linkedin','connect','message','sales_inmail')
+      AND da.state IN ('sending','confirmed','unknown')
+  `).all(...activeRunIds) as Array<{ channel: "linkedin" | "email"; sender_id: string | null }>;
+  const linkedinInboxAccounts = new Set(seenAccounts);
+  for (const inbox of activeReplyInboxes) {
+    if (inbox.channel === "linkedin" && inbox.sender_id) linkedinInboxAccounts.add(inbox.sender_id);
+  }
+
   // Daily sync: stamp accepted connections from invitation manager (once per 23h per account)
   for (const accountId of seenAccounts) {
     if (shouldSyncAccepted(accountId)) {
@@ -1096,7 +1125,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
   }
 
   // Complete public inbox sync provides reply evidence and freshness before sends.
-  for (const accountId of seenAccounts) {
+  for (const accountId of linkedinInboxAccounts) {
     const freshness = getInboxFreshness(db, { accountId, channel: "linkedin", maxAgeMs: 15 * 60_000 });
     // A failed session/checkpoint should not be hit every 30-second tick.
     const failedRecently = freshness.lastFailureAt && Date.now() - Date.parse(freshness.lastFailureAt) < 15 * 60_000;
@@ -1121,18 +1150,9 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
   }
 
   // Sync email IMAP inboxes for each unique email account in active run profiles
-  const activeRunIds = activeRuns.map(r => r.run_id);
-  const activeEmailAccountIds: string[] = activeRunIds.length > 0
-    ? [...new Set(
-        (db.prepare(
-          `SELECT DISTINCT rp.email_account_id FROM run_profiles rp
-           JOIN run_profile_tracks rt ON rt.run_profile_id = rp.id
-           WHERE rp.run_id IN (${activeRunIds.map(() => "?").join(",")})
-           AND rp.email_account_id IS NOT NULL
-           AND rt.state NOT IN ('completed', 'failed', 'skipped')`
-        ).all(...activeRunIds) as { email_account_id: string }[]).map(r => r.email_account_id)
-      )]
-    : [];
+  const activeEmailAccountIds = [...new Set(activeReplyInboxes
+    .filter(inbox => inbox.channel === "email" && inbox.sender_id)
+    .map(inbox => inbox.sender_id!))];
 
   const seenEmailAccounts = new Set<string>();
   for (const emailAccId of activeEmailAccountIds) {
