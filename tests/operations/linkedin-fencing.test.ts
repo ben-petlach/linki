@@ -5,6 +5,7 @@ import type { Page } from "playwright";
 import { getDb } from "../../lib/db";
 import { syncLinkedInInbox } from "../../lib/linkedin/inbox";
 import { recordInboxSyncSuccess } from "../../lib/reliability/inbox-state";
+import { getInboxFreshness } from "../../lib/reliability/inbox-state";
 import { claimPoll, completePoll, stillOwnsPoll } from "../../lib/reliability/scheduler";
 import { evaluateEligibility } from "../../lib/reliability/suppression";
 
@@ -73,4 +74,20 @@ test("old LinkedIn inbox scan cannot commit reply after another worker takes lea
     releaseGoto();
     winner.close();
   }
+});
+
+test("production LinkedIn scanner fails closed on login redirect and throttled Voyager response", async () => {
+  const db = getDb();
+  db.prepare(`INSERT INTO accounts (id, name, email, is_authenticated)
+    VALUES ('login-redirect-li', 'Login redirect', 'login-redirect@example.test', 1),
+           ('throttled-li', 'Throttled', 'throttled@example.test', 1)`).run();
+  const redirect = { goto: async () => undefined, url: () => "https://www.linkedin.com/login" } as unknown as Page;
+  await assert.rejects(syncLinkedInInbox(db, "login-redirect-li", redirect), /redirected to login or checkpoint/);
+  assert.equal(getInboxFreshness(db, { accountId: "login-redirect-li", channel: "linkedin", maxAgeMs: 30 * 60_000 }).fresh, false);
+  const throttled = { goto: async () => undefined, url: () => "https://www.linkedin.com/messaging/",
+    evaluate: async () => ({ error: "LinkedIn Voyager HTTP 429" }) } as unknown as Page;
+  await assert.rejects(syncLinkedInInbox(db, "throttled-li", throttled), /HTTP 429/);
+  assert.equal(getInboxFreshness(db, { accountId: "throttled-li", channel: "linkedin", maxAgeMs: 30 * 60_000 }).fresh, false);
+  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM linkedin_inbox_events WHERE account_id IN ('login-redirect-li','throttled-li')")
+    .get() as { count: number }).count, 0);
 });
