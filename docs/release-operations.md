@@ -2,6 +2,8 @@
 
 This package has no production deployment or live-provider validation. The container is built from this fork. `docker-compose.yml` no longer pulls `moaljumaa/linki:latest`. Its Node 22 Debian 13 base is pinned by digest and refreshed with available OS security updates; Playwright installs the Chromium revision in `package-lock.json`. Headless runtime removes Xvfb and its server packages after browser installation; the image also removes npm's build-only package manager. CI must rebuild, run browser smoke tests, and scan OS/browser packages on every release. A browser update can invalidate LinkedIn cookies; reauthenticate under the new browser before an approved pilot.
 
+This image supports headless Chromium. The visible `headless: false` manual login path needs a desktop browser/display and is not validated inside this container. Use a separately reviewed local account setup before a controlled pilot.
+
 ## Runtime contract
 
 Start through `scripts/start-server.mjs` (the Docker command). It rejects missing, short, or known-placeholder `NEXTAUTH_SECRET` and `AUTH_PASSWORD`, a nonlocal HTTP `NEXTAUTH_URL`, and relative `LINKI_DB_PATH` **before** starting Next or any background job. Do not put these values into image build arguments. Keep the same `NEXTAUTH_SECRET` with a restored database: it derives the key for encrypted provider credentials. Secrets and `.env.local` are never part of a database backup.
