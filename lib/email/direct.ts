@@ -8,7 +8,7 @@ import { sendEmail, type EmailAccount } from "@/lib/email/sender";
 /** All prospect-facing direct email must pass the same durable and policy gates as runner sends. */
 export async function sendDirectEmail(db: Database.Database, input: {
   targetId: string; account: EmailAccount; recipient: string; subject: string;
-  body: string; idempotencyKey: string;
+  body: string; idempotencyKey: string; replyId?: string; inReplyTo?: string; references?: string[];
 }): Promise<{ ok: true; messageId: string } | { ok: false; status: number; error: string }> {
   if (!/^[a-zA-Z0-9._:-]{8,128}$/.test(input.idempotencyKey)) {
     return { ok: false, status: 400, error: "idempotencyKey must be 8–128 safe characters" };
@@ -17,7 +17,7 @@ export async function sendDirectEmail(db: Database.Database, input: {
   const digest = createHash("sha256").update(key).digest("hex");
   const domain = input.account.from_email.split("@")[1];
   const messageId = `<${digest}@${domain}>`;
-  const initial = gate(db, input.targetId, input.account.id, input.recipient, false);
+  const initial = gate(db, input.targetId, input.account.id, input.recipient, false, input.replyId, input.inReplyTo);
   if (initial) return { ok: false, status: 409, error: initial };
   const claim = claimAction(db, { key, senderId: input.account.id, targetId: input.targetId, channel: "email" });
   if (!claim.claimed) return { ok: false, status: 409, error: `Action already ${claim.state}: ${claim.reason}` };
@@ -26,14 +26,14 @@ export async function sendDirectEmail(db: Database.Database, input: {
   try {
     registerOutboundEmail(db, { actionKey: key, targetId: input.targetId, emailAccountId: input.account.id,
       recipient: input.recipient, messageId, subject: input.subject,
-      payloadHash: createHash("sha256").update(input.subject + "\0" + input.body).digest("hex") });
-    const begun = beginDispatch(db, key, token, () => gate(db, input.targetId, input.account.id, input.recipient, true));
+      payloadHash: createHash("sha256").update(input.subject + "\0" + input.body + "\0" + (input.inReplyTo ?? "") + "\0" + (input.references ?? []).join(" ")).digest("hex") });
+    const begun = beginDispatch(db, key, token, () => gate(db, input.targetId, input.account.id, input.recipient, true, input.replyId, input.inReplyTo));
     if (!begun.started) {
       if (releaseClaim(db, key, token)) db.prepare("DELETE FROM email_outbound WHERE action_key = ? AND accepted_at IS NULL").run(key);
       return { ok: false, status: 409, error: begun.reason ?? "Send blocked" };
     }
     started = true;
-    const result = await sendEmail(input.account, input.recipient, input.subject, input.body, { messageId });
+    const result = await sendEmail(input.account, input.recipient, input.subject, input.body, { messageId, inReplyTo: input.inReplyTo, references: input.references });
     if (!result.accepted.some(value => value.toLowerCase() === input.recipient.toLowerCase())) {
       holdUnknown(db, key, token, "SMTP response did not acknowledge recipient");
       return { ok: false, status: 502, error: "SMTP did not acknowledge recipient; held for review" };
@@ -51,11 +51,19 @@ export async function sendDirectEmail(db: Database.Database, input: {
   }
 }
 
-function gate(db: Database.Database, targetId: string, accountId: string, recipient: string, registered: boolean): string | null {
+function gate(db: Database.Database, targetId: string, accountId: string, recipient: string, registered: boolean, replyId?: string, inReplyTo?: string): string | null {
   const target = db.prepare("SELECT email, email_status FROM targets WHERE id = ?")
     .get(targetId) as { email: string | null; email_status: string | null } | undefined;
   if (!target || target.email?.trim().toLowerCase() !== recipient.trim().toLowerCase()) return "Recipient identity changed";
   if (target.email_status === "invalid") return "Email address invalid";
+  if (replyId) {
+    const reply = db.prepare("SELECT target_id, email_account_id, message_id, from_email FROM email_replies WHERE id = ?")
+      .get(replyId) as { target_id: string; email_account_id: string | null; message_id: string | null; from_email: string } | undefined;
+    if (!reply || reply.target_id !== targetId || reply.email_account_id !== accountId ||
+        reply.from_email.trim().toLowerCase() !== recipient.trim().toLowerCase() || reply.message_id !== inReplyTo) {
+      return "Reply association changed";
+    }
+  }
   const assignment = db.prepare(`SELECT COUNT(*) AS total,
     SUM(CASE WHEN email_account_id = ? THEN 1 ELSE 0 END) AS matching
     FROM run_profiles WHERE target_id = ? AND email_account_id IS NOT NULL`)

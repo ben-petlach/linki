@@ -7,8 +7,8 @@ import { decryptSecret } from "@/lib/crypto";
 import { initInboxStateSchema, recordInboxSyncFailure, recordInboxSyncSuccess, getInboxFreshness } from "@/lib/reliability/inbox-state";
 import { suppressIdentity, suppressTarget } from "@/lib/reliability/suppression";
 
-const MAX_INBOX_AGE_MS = 3 * 60 * 60 * 1000;
-const POLL_INTERVAL_MS = 2 * 60 * 60 * 1000;
+export const MAX_EMAIL_INBOX_AGE_MS = 5 * 60_000;
+const POLL_INTERVAL_MS = 2 * 60_000;
 
 type Db = Database.Database;
 interface EmailAccount {
@@ -44,6 +44,12 @@ export function initEmailReliabilitySchema(db: Db): void {
       PRIMARY KEY (email_account_id, message_id)
     );
   `);
+  const replyTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_replies'").get();
+  if (replyTable) {
+    const columns = db.prepare("PRAGMA table_info(email_replies)").all() as Array<{ name: string }>;
+    if (!columns.some(column => column.name === "email_account_id")) db.exec("ALTER TABLE email_replies ADD COLUMN email_account_id TEXT");
+    if (!columns.some(column => column.name === "message_id")) db.exec("ALTER TABLE email_replies ADD COLUMN message_id TEXT");
+  }
 }
 
 export function registerOutboundEmail(db: Db, input: {
@@ -82,6 +88,14 @@ function textBody(mail: ParsedMail): string {
     .replace(/\r\n/g, "\n").trim().slice(0, 16_000);
 }
 
+function hardBounceRecipient(report: string): string | null {
+  for (const section of report.split(/\r?\n\s*\r?\n/)) {
+    const recipient = section.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i)?.[1]?.toLowerCase();
+    if (recipient && /Action:\s*failed\b/i.test(section) && /Status:\s*5\.\d(?:\.\d+)?\b/i.test(section)) return recipient;
+  }
+  return null;
+}
+
 function headerIds(mail: ParsedMail): string[] {
   const refs = typeof mail.references === "string" ? [mail.references] : (mail.references ?? []);
   return [...refs, mail.inReplyTo ?? ""].flatMap(x => x.match(/<[^<>]+>/g) ?? [])
@@ -99,6 +113,7 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
   const receivedAt = (mail.date ?? new Date()).toISOString();
   const from = address(mail);
   const body = textBody(mail);
+  const dsnReport = [mail.text ?? "", ...mail.attachments.filter(attachment => attachment.contentType === "message/delivery-status").map(attachment => attachment.content.toString())].join("\n");
   const ids = headerIds(mail);
   let threaded = false;
   let matched: { target_id: string; recipient_email: string; accepted_at: string | null; created_at: string } | undefined;
@@ -108,7 +123,7 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
     if (matched) { threaded = true; break; }
   }
   const isDsn = /mailer-daemon|postmaster|mail-delivery-subsystem|delivery-status/i.test(from);
-  const finalRecipient = isDsn ? body.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i)?.[1]?.toLowerCase() : undefined;
+  const finalRecipient = isDsn ? hardBounceRecipient(dsnReport) : null;
   const unsubscribed = /\b(unsubscribe|remove me|stop emailing|do not email|don't email|opt out)\b/i.test(body);
   // Unthreaded opt-outs and DSNs use exact address plus accepted outbound chronology.
   // Ordinary replies require RFC threading IDs; old unrelated email cannot pause a campaign.
@@ -119,8 +134,7 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
   }
   if (!matched || Date.parse(receivedAt) < Date.parse(matched.accepted_at ?? matched.created_at)) return "ignored";
   if (isDsn) {
-    if (!finalRecipient || finalRecipient !== matched.recipient_email ||
-        !/Action:\s*failed\b/i.test(body) || !/Status:\s*5\.\d(?:\.\d+)?\b/i.test(body)) return "ignored";
+    if (!finalRecipient || finalRecipient !== matched.recipient_email) return "ignored";
     db.transaction(() => {
       db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, 'bounce', ?)")
         .run(emailAccountId, messageId, matched!.target_id, receivedAt);
@@ -145,9 +159,9 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
   db.transaction(() => {
     db.prepare("INSERT INTO email_inbound (email_account_id, message_id, target_id, kind, received_at) VALUES (?, ?, ?, ?, ?)")
       .run(emailAccountId, messageId, matched!.target_id, kind, receivedAt);
-    db.prepare(`INSERT INTO email_replies (id, target_id, run_id, from_email, subject, body_text, received_at)
-      VALUES (?, ?, (SELECT rp.run_id FROM run_profiles rp WHERE rp.target_id = ? AND rp.email_account_id = ? ORDER BY rp.created_at DESC LIMIT 1), ?, ?, ?, ?)`)
-      .run(randomUUID(), matched!.target_id, matched!.target_id, emailAccountId, from, mail.subject ?? null, body, receivedAt);
+    db.prepare(`INSERT INTO email_replies (id, target_id, run_id, email_account_id, message_id, from_email, subject, body_text, received_at)
+      VALUES (?, ?, (SELECT rp.run_id FROM run_profiles rp WHERE rp.target_id = ? AND rp.email_account_id = ? ORDER BY rp.created_at DESC LIMIT 1), ?, ?, ?, ?, ?, ?)`)
+      .run(randomUUID(), matched!.target_id, matched!.target_id, emailAccountId, emailAccountId, messageId, from, mail.subject ?? null, body, receivedAt);
     db.prepare("UPDATE targets SET email_replied_at = COALESCE(email_replied_at, ?) WHERE id = ?")
       .run(receivedAt, matched!.target_id);
     suppressTarget(db, matched!.target_id, "inbound_reply", messageId);
@@ -164,7 +178,7 @@ export async function processInboundEmail(db: Db, emailAccountId: string, raw: B
 
 export function isEmailInboxFresh(db: Db, emailAccountId: string): { fresh: boolean; reason: string | null } {
   initInboxStateSchema(db);
-  return getInboxFreshness(db, { accountId: emailAccountId, channel: "email", maxAgeMs: MAX_INBOX_AGE_MS });
+  return getInboxFreshness(db, { accountId: emailAccountId, channel: "email", maxAgeMs: MAX_EMAIL_INBOX_AGE_MS });
 }
 
 export function shouldSyncEmailInbox(emailAccountId: string): boolean {

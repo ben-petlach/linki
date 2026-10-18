@@ -281,11 +281,13 @@ test("local TLS SMTP sends once per direct action and late suppression blocks ne
     "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1"],
     { stdio: "ignore" });
   let received = 0;
+  const receivedMessages: string[] = [];
   const server = new SMTPServer({ secure: true, key: readFileSync(key), cert: readFileSync(cert),
     authOptional: true, onAuth(auth, _session, callback) { callback(null, { user: auth.username }); },
     onData(stream, _session, callback) {
-      stream.on("data", () => {});
-      stream.on("end", () => { received++; callback(); });
+      const chunks: Buffer[] = [];
+      stream.on("data", chunk => chunks.push(chunk));
+      stream.on("end", () => { received++; receivedMessages.push(Buffer.concat(chunks).toString()); callback(); });
     },
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -299,9 +301,9 @@ test("local TLS SMTP sends once per direct action and late suppression blocks ne
   db.close();
   const port = (server.server.address() as { port: number }).port;
   const childPath = resolve("tests/reliability/fixtures/direct-send-child.ts");
-  async function invoke(idempotencyKey: string): Promise<{ ok: boolean; error?: string }> {
+  async function invoke(idempotencyKey: string, replyTo?: string): Promise<{ ok: boolean; error?: string }> {
     const output = await new Promise<string>((resolveOutput, reject) => {
-      const child = spawn(resolve("node_modules/.bin/tsx"), [childPath, dbPath, String(port), idempotencyKey], {
+      const child = spawn(resolve("node_modules/.bin/tsx"), [childPath, dbPath, String(port), idempotencyKey, ...(replyTo ? [replyTo] : [])], {
         env: { ...process.env, NODE_EXTRA_CA_CERTS: cert }, stdio: ["ignore", "pipe", "pipe"] });
       let out = ""; let error = "";
       child.stdout.on("data", data => { out += data; });
@@ -315,15 +317,55 @@ test("local TLS SMTP sends once per direct action and late suppression blocks ne
     assert.equal((await invoke("direct-request-1")).ok, true);
     assert.equal((await invoke("direct-request-1")).ok, false);
     assert.equal(received, 1);
+    assert.equal((await invoke("direct-request-reply", "<inbound-1@example.com>")).ok, true);
+    assert.equal(received, 2);
+    assert.match(receivedMessages[1], /In-Reply-To: <inbound-1@example.com>/i);
+    assert.match(receivedMessages[1], /References: <inbound-1@example.com>/i);
     const update = new Database(dbPath);
     try { suppressIdentity(update, { kind: "email", value: "alice@example.com", reason: "unsubscribe" }); }
     finally { update.close(); }
     const blocked = await invoke("direct-request-2");
     assert.equal(blocked.ok, false);
     assert.match(blocked.error ?? "", /Suppressed/);
-    assert.equal(received, 1);
+    assert.equal(received, 2);
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+
+test("inbox query binds latest reply to receiving sender and POST rejects other sender", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "linki-inbox-route-"));
+  const dbPath = join(dir, "test.sqlite");
+  try {
+    const childPath = resolve("tests/reliability/fixtures/inbox-routing-child.ts");
+    const output = await new Promise<string>((resolveOutput, reject) => {
+      const child = spawn(resolve("node_modules/.bin/tsx"), [childPath], {
+        env: { ...process.env, LINKI_DB_PATH: dbPath, NEXTAUTH_SECRET: "synthetic-test-only-secret" },
+        stdio: ["ignore", "pipe", "pipe"] });
+      let out = ""; let error = "";
+      child.stdout.on("data", data => { out += data; });
+      child.stderr.on("data", data => { error += data; });
+      child.on("error", reject);
+      child.on("close", code => code === 0 ? resolveOutput(out) : reject(new Error(error)));
+    });
+    const result = JSON.parse(output) as { account: string; replyId: string; wrongStatus: number; rightStatus: number; rightBody: { error?: string } };
+    assert.equal(result.account, "sender-a");
+    assert.equal(result.replyId, "reply-a");
+    assert.equal(result.wrongStatus, 409);
+    assert.notEqual(result.rightBody.error, "Reply is not bound to this contact, sender, or message");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test("hard DSN after 17 KB explanatory text still suppresses exact address", async () => {
+  const db = fixture();
+  try {
+    const report = `From: Mailer-Daemon <mailer-daemon@sender.test>\r\nTo: sender@sender.test\r\nDate: Mon, 2 Feb 2026 12:00:00 +0000\r\nMessage-ID: <long-dsn@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/report; report-type=delivery-status; boundary="long"\r\n\r\n--long\r\nContent-Type: text/plain\r\n\r\n${"Explanation. ".repeat(1600)}\r\n--long\r\nContent-Type: message/delivery-status\r\n\r\nFinal-Recipient: rfc822; alice@example.com\r\nAction: failed\r\nStatus: 5.1.1\r\n\r\n--long--\r\n`;
+    assert.ok(report.length > 17_000);
+    assert.equal(await processInboundEmail(db, "account", report), "bounce");
+    assert.equal(evaluateEligibility(db, "a", { channel: "email" }).allowed, false);
+    assert.equal(evaluateEligibility(db, "b", { channel: "email" }).allowed, true);
+  } finally { db.close(); }
 });
