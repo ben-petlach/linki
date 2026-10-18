@@ -8,6 +8,7 @@ import {
   initRelationshipSchema, getRelationship, isConnectedForAccount,
   recordConnectionRequested, getConnectionRequestedAt,
   recordMessagingIdentity, getMessagingIdentity,
+  initLegacyOutreachReview,
 } from "../../lib/reliability/relationships";
 import { initInboxStateSchema, recordInboxSyncSuccess, recordInboxSyncFailure, getInboxFreshness } from "../../lib/reliability/inbox-state";
 import { syncAcceptedFromProvider, type ApiConnection, type ConnectionProvider } from "../../lib/linkedin/sync-accepted";
@@ -148,4 +149,43 @@ test("migration survives two reopens without changing legacy audit or FK integri
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("legacy advanced active run pauses once; future run stays untouched", () => {
+  const db = database();
+  db.pragma("foreign_keys = ON");
+  db.exec(`
+    ALTER TABLE targets ADD COLUMN message_sent_at TEXT;
+    ALTER TABLE targets ADD COLUMN email_replied_at TEXT;
+    ALTER TABLE targets ADD COLUMN email_status TEXT;
+    ALTER TABLE targets ADD COLUMN email TEXT;
+    UPDATE targets SET connection_requested_at = NULL WHERE id = 'two';
+    INSERT INTO targets (id, linkedin_url, email) VALUES ('three', NULL, 'three@example.com');
+    CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT);
+    CREATE TABLE run_profiles (id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(id),
+      target_id TEXT REFERENCES targets(id), current_step INTEGER, last_step_at TEXT);
+    CREATE TABLE run_profile_tracks (id TEXT PRIMARY KEY, run_profile_id TEXT REFERENCES run_profiles(id),
+      current_step INTEGER, last_step_at TEXT, state TEXT);
+    CREATE TABLE logs (id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(id),
+      target_id TEXT REFERENCES targets(id), level TEXT, message TEXT);
+    INSERT INTO runs VALUES ('old', 'running'), ('email-old', 'paused'), ('untouched', 'running');
+    INSERT INTO run_profiles VALUES ('rp-old', 'old', 'one', 0, NULL),
+      ('rp-email', 'email-old', 'three', 0, NULL),
+      ('rp-new', 'untouched', 'two', 0, NULL);
+    INSERT INTO run_profile_tracks VALUES ('track-old', 'rp-old', 2, '2026-01-01', 'in_progress'),
+      ('track-new', 'rp-new', 0, NULL, 'pending');
+    INSERT INTO logs VALUES ('log-email', 'email-old', 'three', 'info', 'Email sent to three');
+  `);
+  assert.equal(initLegacyOutreachReview(db), 2);
+  assert.equal((db.prepare("SELECT status FROM runs WHERE id = 'old'").get() as { status: string }).status, "paused");
+  assert.equal((db.prepare("SELECT status FROM runs WHERE id = 'untouched'").get() as { status: string }).status, "running");
+  assert.equal(initLegacyOutreachReview(db), 0);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM logs").get() as { n: number }).n, 3);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM suppression_rules WHERE reason='legacy_outreach_review' AND kind='target'").get() as { n: number }).n, 2);
+  db.exec(`INSERT INTO runs VALUES ('later', 'running');
+    INSERT INTO run_profiles VALUES ('rp-later', 'later', 'one', 2, '2026-10-17');`);
+  assert.equal(initLegacyOutreachReview(db), 0);
+  assert.equal((db.prepare("SELECT status FROM runs WHERE id = 'later'").get() as { status: string }).status, "running");
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+  db.close();
 });

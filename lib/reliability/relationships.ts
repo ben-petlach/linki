@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
+import { suppressTarget } from "@/lib/reliability/suppression";
 
 export interface ConnectedEvidence {
   accountId: string;
@@ -137,4 +139,65 @@ export function getMessagingIdentity(
     FROM account_target_state WHERE account_id = ? AND target_id = ?`).get(accountId, targetId) as
     { messagingUrn: string | null } | undefined;
   return row?.messagingUrn ?? null;
+}
+
+/** One-time hold for runs whose pre-upgrade sends cannot be attributed safely. */
+export function initLegacyOutreachReview(db: Database.Database): number {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS reliability_migrations (
+      name TEXT PRIMARY KEY,
+      completed_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS legacy_outreach_review (
+      run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+      prior_status TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  const hasTracks = !!db.prepare(`SELECT 1 FROM sqlite_master
+    WHERE type = 'table' AND name = 'run_profile_tracks'`).get();
+  const trackCriterion = hasTracks ? `OR EXISTS (
+    SELECT 1 FROM run_profile_tracks rpt WHERE rpt.run_profile_id = rp.id
+      AND (rpt.current_step > 0 OR rpt.last_step_at IS NOT NULL
+        OR rpt.state IN ('in_progress', 'completed'))
+  )` : "";
+  const runProfileColumns = db.prepare("PRAGMA table_info(run_profiles)").all() as Array<{ name: string }>;
+  const legacyStepCriterion = runProfileColumns.some((column) => column.name === "current_step")
+    ? "OR rp.current_step > 0 OR rp.last_step_at IS NOT NULL" : "";
+  const reason = "Legacy outreach may have occurred before sender-scoped send records; review before resuming";
+  return db.transaction(() => {
+    if (db.prepare(`SELECT 1 FROM reliability_migrations
+      WHERE name = 'legacy_outreach_review_v1'`).get()) return 0;
+    const participants = db.prepare(`
+      SELECT r.id AS runId, r.status, rp.id AS profileId, rp.target_id AS targetId
+      FROM runs r JOIN run_profiles rp ON rp.run_id = r.id
+      JOIN targets t ON t.id = rp.target_id
+      WHERE r.status IN ('running', 'paused') AND (
+        t.message_sent_at IS NOT NULL OR t.connection_requested_at IS NOT NULL
+        OR t.email_replied_at IS NOT NULL OR t.email_status = 'sent'
+        OR EXISTS (SELECT 1 FROM logs l WHERE l.run_id = r.id
+          AND l.target_id = rp.target_id AND l.message LIKE 'Email sent%')
+        ${legacyStepCriterion} ${trackCriterion}
+      )
+    `).all() as Array<{ runId: string; status: string; profileId: string; targetId: string }>;
+    const pause = db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?");
+    const review = db.prepare(`INSERT INTO legacy_outreach_review
+      (run_id, prior_status, reason) VALUES (?, ?, ?)`);
+    const log = db.prepare(`INSERT INTO logs (id, run_id, level, message)
+      VALUES (?, ?, 'warn', ?)`);
+    const reviewedRuns = new Set<string>();
+    for (const participant of participants) {
+      suppressTarget(db, participant.targetId, "legacy_outreach_review",
+        `run:${participant.runId};profile:${participant.profileId}`);
+      if (reviewedRuns.has(participant.runId)) continue;
+      reviewedRuns.add(participant.runId);
+      pause.run(participant.runId);
+      review.run(participant.runId, participant.status, reason);
+      log.run(randomUUID(), participant.runId, reason);
+    }
+    db.prepare(`INSERT INTO reliability_migrations (name, completed_at)
+      VALUES ('legacy_outreach_review_v1', datetime('now'))`).run();
+    return reviewedRuns.size;
+  })();
 }
