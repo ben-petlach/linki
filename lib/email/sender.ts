@@ -1,4 +1,4 @@
-import nodemailer from "nodemailer";
+import nodemailer from "linki-nodemailer";
 import Imap from "imap";
 import { randomUUID } from "crypto";
 
