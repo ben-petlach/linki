@@ -118,44 +118,40 @@ No SaaS middleman. No per-seat pricing. No black box.
 cp .env.example .env.local
 ```
 
-Fill in `.env.local`:
+Set `NEXTAUTH_URL` to your local URL, generate `NEXTAUTH_SECRET` with
+`openssl rand -base64 48`, and set `AUTH_PASSWORD` to a unique password of at
+least 16 characters. Paste the generated values into `.env.local`; do not put
+the shell command itself in that file. The example file leaves both secrets
+blank on purpose. Keep `NEXTAUTH_SECRET` for database restores because it
+encrypts stored provider credentials.
 
 ```env
-# Public URL of the app (e.g. https://linki.yourdomain.com or http://localhost:3456)
 NEXTAUTH_URL=http://localhost:3456
-
-# Random secret: generate with: openssl rand -base64 32
-NEXTAUTH_SECRET=your_random_secret_here
-
-# Password to log in to the Linki UI
-AUTH_PASSWORD=your_password_here
+NEXTAUTH_SECRET=<paste-generated-value>
+AUTH_PASSWORD=<paste-unique-password>
 ```
 
-**2. Start the container**
+**2. Build this checkout and start the container**
 
 ```bash
+export LINKI_SOURCE_COMMIT="$(git rev-parse HEAD)"
+export APP_VERSION="$(git rev-parse --short HEAD)"
+docker compose build
+export LINKI_IMAGE_DIGEST="$(docker image inspect "linki-local:${APP_VERSION}" --format '{{.Id}}')"
 docker compose up -d
 ```
 
-Or pull the image directly:
-
-```bash
-docker run -d -p 3456:3000 \
-  -e NEXTAUTH_URL=http://localhost:3456 \
-  -e NEXTAUTH_SECRET=your_random_secret_here \
-  -e AUTH_PASSWORD=your_password_here \
-  -v $(pwd)/data:/data \
-  moaljumaa/linki:latest
-```
-
-Linki is now running at `http://localhost:3456`. The SQLite database is persisted in `./data/linki.db` on your host machine.
+Linki is at `http://localhost:3456`. Compose uses a named `linki_data` volume
+for SQLite. Existing `./data` files are not adopted automatically. See
+[release and restore operations](docs/release-operations.md) before migration,
+backup, or rollback. Building this image does not connect any provider account.
 
 ### Self-host manually (Node.js)
 
 Requires Node.js 22+.
 
 ```bash
-npm install
+npm ci
 npm run build
 npm start
 ```
