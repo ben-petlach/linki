@@ -28,10 +28,12 @@ function database() {
     CREATE TABLE targets (id TEXT PRIMARY KEY, linkedin_url TEXT, email TEXT, company_id TEXT, message_sent_at TEXT, last_replied_at TEXT);
     CREATE TABLE runs (id TEXT PRIMARY KEY, account_id TEXT);
     CREATE TABLE run_profiles (id TEXT PRIMARY KEY, run_id TEXT, target_id TEXT);
+    CREATE TABLE run_profile_tracks (id TEXT PRIMARY KEY, run_profile_id TEXT, track TEXT, state TEXT);
     INSERT INTO accounts VALUES ('ben');
     INSERT INTO targets VALUES ('alex', 'https://www.linkedin.com/in/alex-smith', 'alex@example.com', NULL, '2026-10-17T15:00:00.000Z', NULL);
     INSERT INTO runs VALUES ('run1', 'ben');
     INSERT INTO run_profiles VALUES ('rp1', 'run1', 'alex');
+    INSERT INTO run_profile_tracks VALUES ('track1', 'rp1', 'linkedin', 'in_progress');
   `);
   initInboxStateSchema(db);
   initSuppressionSchema(db);
@@ -102,6 +104,7 @@ test("unknown pagination shape invalidates inbox freshness and records no reply"
 test("reply after invitation alone blocks the first message", async () => {
   const db = database();
   db.prepare("DELETE FROM dispatch_actions WHERE action_key = 'send-1'").run();
+  db.prepare("UPDATE targets SET message_sent_at = NULL WHERE id = 'alex'").run();
   db.prepare(`INSERT INTO dispatch_actions
     (action_key, state, token, dispatched_at, sender_id, target_id, channel, payload, evidence)
     VALUES ('invite-1', 'confirmed', 'tok', '2026-10-17 12:00:00', 'ben', 'alex', 'connect', NULL, 'pending:alex')`).run();
@@ -109,5 +112,15 @@ test("reply after invitation alone blocks the first message", async () => {
   try {
     assert.equal(await syncLinkedInInbox(db, "ben", page), 1);
     assert.equal(evaluateEligibility(db, "alex").allowed, false);
+  } finally { await browser.close(); db.close(); }
+});
+
+test("legacy active send with no sender-scoped action keeps inbox stale for review", async () => {
+  const db = database();
+  db.prepare("DELETE FROM dispatch_actions WHERE action_key = 'send-1'").run();
+  const { browser, page } = await browserFixture();
+  try {
+    await assert.rejects(syncLinkedInInbox(db, "ben", page), /legacy message.*review required/i);
+    assert.equal(getInboxFreshness(db, { accountId: "ben", channel: "linkedin", maxAgeMs: 60000 }).fresh, false);
   } finally { await browser.close(); db.close(); }
 });

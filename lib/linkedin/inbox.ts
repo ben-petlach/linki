@@ -296,6 +296,19 @@ export async function syncLinkedInInbox(db: Database.Database, accountId: string
   initLinkedInInboxSchema(db);
   const startedAt = new Date().toISOString();
   try {
+    const legacy = db.prepare(`SELECT t.id FROM targets t
+      JOIN run_profiles rp ON rp.target_id = t.id
+      JOIN runs r ON r.id = rp.run_id
+      JOIN run_profile_tracks tr ON tr.run_profile_id = rp.id
+      WHERE r.account_id = ? AND tr.track = 'linkedin'
+        AND tr.state IN ('pending','in_progress') AND t.message_sent_at IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM dispatch_actions a
+          WHERE a.sender_id = r.account_id AND a.target_id = t.id
+            AND a.channel = 'message' AND a.state IN ('sending','confirmed','unknown'))
+      LIMIT 1`).get(accountId) as { id: string } | undefined;
+    if (legacy) throw new IncompleteLinkedInInboxError(
+      `Active legacy message for target ${legacy.id} has no account-scoped send evidence; review required`
+    );
     const events = await scanInbox(page);
     const rows = db.prepare(`SELECT DISTINCT t.id, t.linkedin_url,
         (SELECT MIN(a.dispatched_at) FROM dispatch_actions a
