@@ -8,7 +8,8 @@ with lemlist, Gojiberry, or Origami, or authorize production migration.
 
 Use Node 22 (`.nvmrc`), `npm ci`, and `npx playwright install chromium`.
 Run `npm run typecheck`, `npm run lint`, `npm run test:reliability`,
-`npm run test:integration`, and `npm run build`.
+`npm run test:integration`, `npm run test:dependencies`, `npm run audit:security`,
+and `npm run build`.
 The GitHub Actions workflow runs these gates and repeats crash/concurrency tests
 three times. Tests use synthetic data, real SQLite, local browser pages, and local
 SMTP/IMAP fixtures. The test bootstrap blocks non-local Node socket connections;
@@ -55,21 +56,25 @@ browser fixtures intercept requests. No production accounts or outreach are used
 - Upstream lint already had 42 diagnostics. `npm run lint` enforces no new
   diagnostics against the checked-in baseline; it is not a claim of zero lint debt.
   `npm run lint:all` shows the full inherited debt.
-- Full dependency audit reports 34 vulnerabilities, including three critical
-  and 24 high. Dependency modernization is outside these five packages. This
-  inherited security debt must be triaged before internet-facing production use;
-  passing reliability tests does not establish security readiness.
+- Dependency remediation reduced the full audit from 34 findings (3 critical,
+  24 high) to zero. See [changes and override rationale](dependency-remediation.md).
+  CI blocks new high/critical findings. Passing dependency and reliability checks
+  does not establish overall security readiness.
 
 ## Verification results
 
 Local verification on Node 22.23.1, 2026-10-17:
 
 - Package suite: 54/54 pass, zero skips.
-- Integration suite: 10/10 pass, zero skips, including two-start legacy quarantine.
-- Crash/concurrency subset: 15/15 pass in each of three consecutive runs.
+- Integration suite: 13/13 pass, zero skips, including two-start legacy quarantine
+  and three auth-upgrade regression tests.
+- Dependency compatibility suite: 4/4 pass, zero skips.
+- Full dependency audit: zero findings after clean `npm ci`; `npm ls --all` passes.
+- Crash/concurrency subset: 18/18 pass in each of three consecutive runs.
   Command: `node --import ./tests/setup.mjs --import tsx --test tests/reliability/dispatch.test.ts tests/reliability/suppression-routes.test.ts tests/integration/*.test.ts`.
 - `npm run typecheck` and `npm run build`: pass.
-- `npm run lint`: zero new diagnostics; 41 inherited diagnostics remain.
+- `npm run lint`: zero new diagnostics; 43 inherited diagnostics remain; the upgraded lint rules exposed two additional
+  findings reproduced on the original upstream source (documented in the dependency report).
 - Independent read-only reviewers rechecked reported findings after fixes and
   found no unresolved critical/high issue in the changed state, LinkedIn, mail,
   or dispatch paths. This is a scoped code review, not a full security audit.

@@ -116,7 +116,7 @@
     "ruleId": "react/no-unescaped-entities",
     "message": "`'` can be escaped with `&apos;`, `&lsquo;`, `&#39;`, `&rsquo;`.",
     "severity": 2,
-    "source": "Uses <span className=\"text-base-content/60 font-mono\">{senderParent.name}</span>'s SMTP/IMAP credentials \u2014 only the sender identity below is new."
+    "source": "Uses <span className=\"text-base-content/60 font-mono\">{senderParent.name}</span>'s SMTP/IMAP credentials — only the sender identity below is new."
   },
   {
     "file": "pages/settings.tsx",
@@ -292,5 +292,19 @@
     "message": "A `require()` style import is forbidden.",
     "severity": 2,
     "source": "const path = require(\"path\");"
+  },
+  {
+    "file": "pages/inbox.tsx",
+    "ruleId": "react-hooks/set-state-in-effect",
+    "message": "Error: Calling setState synchronously within an effect can trigger cascading renders\n\nEffects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:\n* Update external systems with the latest state from React.\n* Subscribe for updates from some external system, calling setState in a callback function when external state changes.\n\nCalling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).",
+    "severity": 2,
+    "source": "setLoadingThread(false);"
+  },
+  {
+    "file": "pages/lists/[id].tsx",
+    "ruleId": "@next/next/no-location-assign-relative-destination",
+    "message": "Do not use `window.location.href` to navigate to internal Next.js pages. Use `redirect()` in the render phase, or `useRouter().push()` in Client Components' event handlers instead. See: https://nextjs.org/docs/messages/no-location-assign-relative-destination",
+    "severity": 1,
+    "source": "window.location.href = `/api/lists/${initialList.id}/csv-template`;"
   }
 ]

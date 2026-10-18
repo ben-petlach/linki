@@ -13,23 +13,21 @@
     "test:reliability": "node --import ./tests/setup.mjs --import tsx --test tests/reliability/*.test.ts",
     "test:integration": "node --import ./tests/setup.mjs --import tsx --test tests/integration/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "lint:all": "eslint"
+    "lint:all": "eslint",
+    "audit:security": "npm audit --audit-level=high",
+    "test:dependencies": "node --test tests/dependency/*.test.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/bcryptjs": "^2.4.6",
     "@types/mailparser": "^3.4.6",
-    "@types/nodemailer": "^8.0.0",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.6.2",
     "daisyui": "^5.5.19",
     "driver.js": "^1.6.0",
-    "imap-simple": "^5.1.0",
     "jsonwebtoken": "^9.0.3",
-    "mailparser": "^3.9.8",
-    "next": "16.1.6",
-    "next-auth": "^4.24.13",
-    "nodemailer": "^7.0.13",
+    "mailparser": "^3.9.40",
+    "next": "16.4.2",
+    "next-auth": "^4.24.15",
     "openai": "^6.34.0",
     "papaparse": "^5.5.3",
     "playwright": "^1.58.2",
@@ -41,12 +39,13 @@
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "sonner": "^2.0.7",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "imap": "^0.8.19",
+    "nodemailer": "^10.1.2"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/imap-simple": "^4.2.10",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20",
     "@types/papaparse": "^5.5.2",
@@ -54,13 +53,26 @@
     "@types/react-dom": "^19",
     "@types/smtp-server": "^3.5.13",
     "eslint": "^9",
-    "eslint-config-next": "16.1.6",
+    "eslint-config-next": "16.4.2",
     "smtp-server": "^3.19.23",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
-    "typescript": "^5"
+    "typescript": "^5",
+    "@types/imap": "^0.8.43",
+    "fast-glob": "file:vendor/fast-glob"
   },
   "engines": {
     "node": ">=22.13.0 <23"
+  },
+  "overrides": {
+    "utf7": {
+      "semver": "5.7.2"
+    },
+    "next-auth": {
+      "nodemailer": "10.1.2"
+    },
+    "@next/eslint-plugin-next": {
+      "fast-glob": "$fast-glob"
+    }
   }
 }

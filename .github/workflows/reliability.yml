@@ -24,6 +24,8 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
+      - run: npm run audit:security
+      - run: npm run test:dependencies
       - run: npx playwright install --with-deps chromium
       - run: npm run typecheck
       - run: npm run lint
