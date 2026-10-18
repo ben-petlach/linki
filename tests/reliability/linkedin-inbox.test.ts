@@ -16,10 +16,6 @@ const other = "urn:li:fsd_profile:ACoAAAOTHER";
 const conversation = `urn:li:msg_conversation:(${self},2-thread)`;
 const participant = (urn: string, profileUrl: string) => ({ hostIdentityUrn: urn,
   participantType: { member: { profileUrl } } });
-const envelope = (name: string, elements: unknown[], metadata?: object) => ({
-  data: { data: { [name]: { elements, ...(metadata ? { metadata } : {}) } } }, included: [],
-});
-
 function database() {
   const db = new Database(":memory:");
   db.exec(`
@@ -47,7 +43,7 @@ function database() {
   return db;
 }
 
-async function browserFixture(incomplete = false) {
+async function browserFixture(incomplete = false, normalized = false, shallow = false) {
   const browser = await chromium.launch({ headless: true, executablePath: chrome });
   const page = await browser.newPage();
   await page.context().addCookies([{ name: "JSESSIONID", value: 'ajax:123', domain: ".linkedin.com", path: "/" }]);
@@ -63,16 +59,31 @@ async function browserFixture(incomplete = false) {
       await route.fulfill({ json: { data: { "*miniProfile": "urn:li:fs_miniProfile:ACoAAASELF" }, included: [{ entityUrn: "urn:li:fs_miniProfile:ACoAAASELF", dashEntityUrn: self }] } });
     } else if (url.searchParams.get("queryId")?.startsWith("messengerConversations")) {
       const cursor = url.searchParams.get("variables")?.includes("nextCursor:page-2");
-      const thread = { entityUrn: conversation,
-        conversationParticipants: [participant(self, "https://www.linkedin.com/in/ben"), participant(other, "https://www.linkedin.com/in/alex-smith")],
-      };
+      const selfParticipant = { entityUrn: "urn:li:msg_conversationParticipant:self", ...participant(self, "https://www.linkedin.com/in/ben") };
+      const otherParticipant = { entityUrn: "urn:li:msg_conversationParticipant:other", ...participant(other, "https://www.linkedin.com/in/alex-smith") };
+      const thread = normalized ? { entityUrn: conversation,
+        "*conversationParticipants": [selfParticipant.entityUrn, otherParticipant.entityUrn],
+      } : { entityUrn: conversation, conversationParticipants: [selfParticipant, otherParticipant] };
       const metadata = cursor ? {} : { nextCursor: "page-2" };
-      await route.fulfill({ json: envelope("messengerConversationsByCategoryQuery", cursor ? [] : [thread], incomplete ? undefined : metadata) });
+      const collection = { ...(normalized ? { "*elements": cursor ? [] : [conversation] } : { elements: cursor ? [] : [thread] }),
+        ...(incomplete ? {} : { metadata }),
+      };
+      const node = { messengerConversationsByCategoryQuery: collection };
+      await route.fulfill({ json: { data: shallow ? node : { data: node },
+        included: normalized ? [thread, selfParticipant, otherParticipant] : [],
+      } });
     } else if (url.searchParams.get("queryId")?.startsWith("messengerMessages")) {
-      await route.fulfill({ json: envelope("messengerMessagesByConversation", [
-        { entityUrn: `urn:li:msg_message:(${self},2-in)`, deliveredAt: Date.parse("2026-10-17T13:00:00Z"), sender: participant(other, "https://www.linkedin.com/in/alex-smith") },
-        { entityUrn: `urn:li:msg_message:(${self},2-out)`, deliveredAt: Date.parse("2026-10-17T12:00:00Z"), sender: participant(self, "https://www.linkedin.com/in/ben") },
-      ]) });
+      const fromOther = { entityUrn: "urn:li:msg_conversationParticipant:other", ...participant(other, "https://www.linkedin.com/in/alex-smith") };
+      const fromSelf = { entityUrn: "urn:li:msg_conversationParticipant:self", ...participant(self, "https://www.linkedin.com/in/ben") };
+      const messages = [
+        { entityUrn: `urn:li:msg_message:(${self},2-in)`, deliveredAt: Date.parse("2026-10-17T13:00:00Z"), ...(normalized ? { "*sender": fromOther.entityUrn } : { sender: fromOther }) },
+        { entityUrn: `urn:li:msg_message:(${self},2-out)`, deliveredAt: Date.parse("2026-10-17T12:00:00Z"), ...(normalized ? { "*sender": fromSelf.entityUrn } : { sender: fromSelf }) },
+      ];
+      const collection = normalized ? { "*elements": messages.map((message) => message.entityUrn) } : { elements: messages };
+      const node = { messengerMessagesByConversation: collection };
+      await route.fulfill({ json: { data: shallow ? node : { data: node },
+        included: normalized ? [...messages, fromOther, fromSelf] : [],
+      } });
     } else await route.fulfill({ status: 404, body: "unexpected" });
   });
   return { browser, page, requests };
@@ -88,6 +99,15 @@ test("Voyager cursor sync records reply once and suppresses all channels", async
     assert.equal((db.prepare("SELECT last_replied_at FROM targets WHERE id = 'alex'").get() as {last_replied_at:string}).last_replied_at, "2026-10-17T13:00:00.000Z");
     assert.equal(evaluateEligibility(db, "alex").allowed, false);
     assert.equal(getInboxFreshness(db, { accountId: "ben", channel: "linkedin", maxAgeMs: 60000 }).fresh, true);
+  } finally { await browser.close(); db.close(); }
+});
+
+test("normalized included references and shallow GraphQL envelope preserve reply identity", async () => {
+  const db = database();
+  const { browser, page } = await browserFixture(false, true, true);
+  try {
+    assert.equal(await syncLinkedInInbox(db, "ben", page), 1);
+    assert.equal(evaluateEligibility(db, "alex").allowed, false);
   } finally { await browser.close(); db.close(); }
 });
 
